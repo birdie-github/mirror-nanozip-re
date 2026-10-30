@@ -25,6 +25,9 @@ namespace selfcheck {
 // 16-byte state whose table CRC from 0 is the CRC of what it consumed.
 std::size_t Crc64Fold(std::uint64_t crc, const unsigned char* p, std::size_t n, unsigned char state[16]);
 bool Crc64FoldAvailable();
+// The same for the archive's CRC-32 (IEEE, reflected), sfx_archive.cpp's
+// UpdateCrc32; available exactly when Crc64Fold is.
+std::size_t Crc32Fold(std::uint32_t crc, const unsigned char* p, std::size_t n, unsigned char state[16]);
 
 // CRC-64/XZ (ECMA-182, reflected; initial value and final xor all ones),
 // folded with carry-less multiplication where the processor has it, else

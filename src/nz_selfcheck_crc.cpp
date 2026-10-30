@@ -56,12 +56,49 @@ std::size_t Crc64Fold(std::uint64_t crc, const unsigned char* p, std::size_t n, 
     return i;
 }
 
+// The archive checksum's CRC-32 (IEEE, reflected; -hC) folded the same way
+// (issue #3 item 2b). Its constants, x^159/x^95 (16 bytes) and x^543/x^479
+// (64), were found by the same search; they are zlib's, without its shift.
+namespace {
+constexpr std::uint64_t kC1 = 0xae689191ull;   // x^159
+constexpr std::uint64_t kC2 = 0xccaa009eull;   // x^95
+constexpr std::uint64_t kC3 = 0x8f352d95ull;   // x^543
+constexpr std::uint64_t kC4 = 0x1d9513d7ull;   // x^479
+}  // namespace
+
+__attribute__((target("pclmul,sse2")))
+std::size_t Crc32Fold(std::uint32_t crc, const unsigned char* p, std::size_t n, unsigned char state[16]) {
+    if (n < 64u) return 0u;
+    const __m128i k12 = _mm_set_epi64x(static_cast<long long>(kC2), static_cast<long long>(kC1));
+    const __m128i k34 = _mm_set_epi64x(static_cast<long long>(kC4), static_cast<long long>(kC3));
+    __m128i x0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p));
+    __m128i x1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 16));
+    __m128i x2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 32));
+    __m128i x3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + 48));
+    x0 = _mm_xor_si128(x0, _mm_cvtsi32_si128(static_cast<int>(crc)));
+    std::size_t i = 64;
+    for (; i + 64u <= n; i += 64u) {
+        x0 = _mm_xor_si128(Fold(x0, k34), _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)));
+        x1 = _mm_xor_si128(Fold(x1, k34), _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 16)));
+        x2 = _mm_xor_si128(Fold(x2, k34), _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 32)));
+        x3 = _mm_xor_si128(Fold(x3, k34), _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i + 48)));
+    }
+    __m128i y = _mm_xor_si128(Fold(x0, k12), x1);
+    y = _mm_xor_si128(Fold(y, k12), x2);
+    y = _mm_xor_si128(Fold(y, k12), x3);
+    for (; i + 16u <= n; i += 16u)
+        y = _mm_xor_si128(Fold(y, k12), _mm_loadu_si128(reinterpret_cast<const __m128i*>(p + i)));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(state), y);
+    return i;
+}
+
 bool Crc64FoldAvailable() {
     static const bool ok = __builtin_cpu_supports("pclmul") && __builtin_cpu_supports("sse2");
     return ok;
 }
 #else
 std::size_t Crc64Fold(std::uint64_t, const unsigned char*, std::size_t, unsigned char*) { return 0u; }
+std::size_t Crc32Fold(std::uint32_t, const unsigned char*, std::size_t, unsigned char*) { return 0u; }
 bool Crc64FoldAvailable() { return false; }
 #endif
 

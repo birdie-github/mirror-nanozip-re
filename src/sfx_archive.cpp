@@ -181,28 +181,49 @@ bool ReadLE(std::istream& in, T* out) {
     return true;
 }
 
-std::uint32_t UpdateCrc32(std::uint32_t crc, const unsigned char* data, std::size_t size) {
-    static std::array<std::uint32_t, 256> table = [] {
-        std::array<std::uint32_t, 256> t{};
-        for (std::uint32_t i = 0; i < t.size(); ++i) {
+// The byte-at-a-time table walk: the reference, and the tail of UpdateCrc32.
+static const std::array<std::array<std::uint32_t, 256>, 8>& Crc32Tables() {
+    static const std::array<std::array<std::uint32_t, 256>, 8> t = [] {
+        std::array<std::array<std::uint32_t, 256>, 8> r{};
+        for (std::uint32_t i = 0; i < 256u; ++i) {
             std::uint32_t x = i;
-            for (unsigned bit = 0; bit < 8; ++bit) {
-                const bool one = (x & 1u) != 0;
-                x >>= 1u;
-                if (one) {
-                    x ^= 0xedb88320u;
-                }
-            }
-            t[i] = x;
+            for (unsigned bit = 0; bit < 8; ++bit) x = (x & 1u) ? (x >> 1u) ^ 0xedb88320u : (x >> 1u);
+            r[0][i] = x;
         }
-        return t;
+        for (std::uint32_t i = 0; i < 256u; ++i)
+            for (unsigned k = 1; k < 8u; ++k) r[k][i] = (r[k - 1][i] >> 8u) ^ r[0][r[k - 1][i] & 0xffu];
+        return r;
     }();
+    return t;
+}
 
+std::uint32_t UpdateCrc32Bytewise(std::uint32_t crc, const unsigned char* data, std::size_t size) {
+    const auto& t = Crc32Tables()[0];
     std::uint32_t x = crc;
-    for (std::size_t i = 0; i < size; ++i) {
-        x = (x >> 8u) ^ table[(x ^ data[i]) & 0xffu];
-    }
+    for (std::size_t i = 0; i < size; ++i) x = (x >> 8u) ^ t[(x ^ data[i]) & 0xffu];
     return x;
+}
+
+// Issue #3 item 2b: it went a byte at a time. Now 64 bytes per step by
+// carry-less multiplication where the processor has it (as the self-check's
+// CRC-64, nz_selfcheck_crc.cpp), else 8 bytes per step through 8 tables
+// (slicing-by-8); the same value either way (tests/encode/crc64_fold.cpp).
+std::uint32_t UpdateCrc32(std::uint32_t crc, const unsigned char* data, std::size_t size) {
+    if (size >= 256u && nzr::selfcheck::Crc64FoldAvailable()) {
+        unsigned char st[16];
+        const std::size_t used = nzr::selfcheck::Crc32Fold(crc, data, size, st);
+        if (used != 0u) { crc = UpdateCrc32Bytewise(0u, st, 16u); data += used; size -= used; }
+    }
+    const auto& t = Crc32Tables();
+    std::uint32_t x = crc;
+    while (size >= 8u) {
+        const std::uint32_t lo = x ^ (static_cast<std::uint32_t>(data[0]) | (static_cast<std::uint32_t>(data[1]) << 8) |
+                                      (static_cast<std::uint32_t>(data[2]) << 16) | (static_cast<std::uint32_t>(data[3]) << 24));
+        x = t[7][lo & 0xffu] ^ t[6][(lo >> 8) & 0xffu] ^ t[5][(lo >> 16) & 0xffu] ^ t[4][lo >> 24] ^
+            t[3][data[4]] ^ t[2][data[5]] ^ t[1][data[6]] ^ t[0][data[7]];
+        data += 8; size -= 8u;
+    }
+    return UpdateCrc32Bytewise(x, data, size);
 }
 
 std::uint32_t UpdateCrc16(std::uint32_t crc, const unsigned char* data, std::size_t size) {
