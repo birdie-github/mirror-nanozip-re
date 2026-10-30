@@ -109,6 +109,7 @@ add_executable(test_optimum_lz
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_parser.cpp
     src/nz_optimum_lz_tables.cpp
+    src/nz_optimum_seg.cpp
     src/nz_cm.cpp
 )
 target_include_directories(test_optimum_lz PRIVATE include)
@@ -128,6 +129,7 @@ add_executable(test_optimum2_lz
     src/nz_optimum_lz.cpp
     src/nz_optimum_lz_parser.cpp
     src/nz_optimum_lz_tables.cpp
+    src/nz_optimum_seg.cpp
     src/nz_cm.cpp
 )
 target_include_directories(test_optimum2_lz PRIVATE include)
