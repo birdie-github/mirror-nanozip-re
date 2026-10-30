@@ -90,6 +90,17 @@ const CostTables& Costs() { static const CostTables t; return t; }
 // The word-wise compare (bytes equal from a/b up to `limit` on a).
 std::uint32_t MatchLen(const std::uint8_t* a, const std::uint8_t* b, const std::uint8_t* limit) {
     const std::uint8_t* s = a;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    // 8 bytes at a time while a whole 8-byte word fits before `limit` (issue #3
+    // item 3): the first differing byte, which is what the word tests below
+    // find, so the same length; and no read further past `limit` than theirs.
+    while (limit - s >= 8) {
+        std::uint64_t x, y;
+        std::memcpy(&x, s, 8); std::memcpy(&y, b, 8);
+        if (x != y) return static_cast<std::uint32_t>(s - a) + (static_cast<std::uint32_t>(__builtin_ctzll(x ^ y)) >> 3);
+        s += 8; b += 8;
+    }
+#endif
     for (;;) {
         if (limit <= s) return static_cast<std::uint32_t>(limit - a);
         const std::uint32_t x = LoadU32(s) ^ LoadU32(b);
