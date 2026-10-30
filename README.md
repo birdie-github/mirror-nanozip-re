@@ -156,7 +156,15 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   replacing stays as it was); when the archive cannot be read back here at all (not enough memory), it
   is kept and a `Note:` line says it was not checked. The original does no such check. It costs a
   decode: on 12 MB of real files at `-t1`, `-cn` +14 %, `-cf` +59 %, `-cF` +100 %, `-cd` +34 %, `-cD`
-  +17 %, `-co` +17 %, `-cO` +21 %, `-cc` +92 % (the CM decodes as slowly as it encodes);
+  +17 %, `-co` +17 %, `-cO` +21 %, `-cc` +92 % (the CM decodes as slowly as it encodes).
+  Since v0.18.0, `-co`, `-cO` and `-cc` with more than one thread make that decode WHILE they
+  compress: each stream gets a decoder of its own, on its own thread, fed every record the moment it
+  goes to the file, and once the file is closed only the container is read back (the same entries,
+  names, sizes and checksums, and a file on disk identical to what was written). The archive is the
+  same; the decode runs beside the compression instead of after it. For as long as it runs it holds a
+  decoder's memory next to the encoder's (for `-cc`, a second model of the same size), so a 32-bit
+  build keeps the check after the fact when that would pass 1 GB, so does a machine with less available
+  memory than the two together plus 256 MiB, and so does `-t1` (the check is a thread of its own). `NZ_SELFCHECK_AFTER=1` asks for the check after the fact;
   `NZ_NO_SELFCHECK=1` turns it off. `s` writes nothing, so it has nothing to check. In v0.17.4-pre it
   wrongly refused `a -cF` of a folder of many files at the default thread count (and `-cf`/`-cF` at
   small `-m`): the archive was right, this port's reader was not (fixed in v0.17.5-pre, see
@@ -168,10 +176,16 @@ tables: [Performance](https://github.com/YadeWira/nanozip-re/wiki/Performance). 
   more than 8 MB writes what `a -t1 -p4` writes, not what `a -t1` writes. Since v0.17.5-pre the
   streams are compressed at the same time, one thread each, up to that `Threads:` count (the store,
   `-cn`, stays serial); up to v0.17.4-pre they were compressed one after another. How many run at once
-  never changes the archive: for a given N it is the one `-t1 -pN` writes, byte for byte, with the
-  files of each stream grouped the `-t1` way. `NZ_THREADS=n` sets only how many run at once, never N.
-  The original's own output above one thread changes from run to run
-  ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison needs `-t1` on the original's side.
+  never changes the archive: for a given N and `-t` it is the one a pool of one thread writes
+  (`NZ_THREADS=1`), byte for byte. `NZ_THREADS=n` sets only how many run at once, never N, and never
+  the thread count the compressors themselves see (that is `-t`, below).
+  The thread count also changes the bytes INSIDE a stream, for `-co`, `-cO` and `-cc`
+  ([quirk 82](docs/ORIGINAL_QUIRKS.md)): above one thread the original searches for block cuts in two
+  halves, writes metadata where its reader thread has got to, lets an async job find the `-co`/`-cO`
+  match candidates and splits BWT blocks into several buckets. Since v0.18.0 this port does the same
+  for the `Threads:` count it reports (before, it always wrote the one-thread form). With several
+  small files the original's output above one thread can still change from run to run
+  ([quirk 58](docs/ORIGINAL_QUIRKS.md)), so a byte comparison of such inputs needs `-t1`.
 - **Decode memory** is above the original's. Peak resident memory, 128 MB of real files, `x -t1`,
   2026-09-25 (the original / this port): `-cn` 129 / 132 MiB, `-cf` 133 / 180, `-cF` 196 / 239, `-cd`
   110 / 153, `-cD` 110 / 152, `-co` 222 / 333, `-cO` 238 / 367, `-cc` 448 / 585 (v0.17.5-pre: `-cd`
@@ -202,7 +216,8 @@ nz-re w32c archive files...      # self-extractor archive.exe: nz_w32c.sfx + the
 Switches, messages, prompts and the exit status follow the original exactly (exit status is always 0,
 as in the original); `nz-re help` lists the advanced options, and `*`, `?` and (since v0.17.0-pre)
 `[...]` in names match as in the original. `w32c` reads the original's `nz_w32c.sfx` from the directory
-of the `nz-re` binary; the stub is not included here. Before v0.13.0-pre the binary was called
+of the `nz-re` binary. Since v0.18.0 the Windows zips carry it next to `nz-re.exe` (NanoZip 0.09a's file,
+unchanged); with the bare binaries it has to be copied there from NanoZip 0.09a. Before v0.13.0-pre the binary was called
 `nz_recon`. Environment variables, all optional:
 
 | variable | effect |
@@ -213,6 +228,8 @@ of the `nz-re` binary; the stub is not included here. Before v0.13.0-pre the bin
 | `NZ_TRACE_CONSTRUCTS=1` | print each format construct met, once (`[construct] k=v` on stderr) |
 | `NZ_NO_SELFCHECK=1` | `a`/`w32c`: skip the whole-archive self-check |
 | `NZ_TRACE_SELFCHECK=1` | `a`/`w32c`: one `[selfcheck]` line on stderr with the verdict, entries, bytes and time |
+| `NZ_SELFCHECK_AFTER=1` | `a`/`w32c`: make the self-check after the compression, as before v0.18.0, also where it would run during it |
+| `NZ_SELFCHECK_LIVE=1` | tests only: make the self-check of `-co`/`-cO`/`-cc` during the compression even at `-t1` |
 | `NZ_SELFCHECK_FAULT=flip\|trunc\|name\|hdr` | tests only: damage the archive `a` writes (a byte, the last two bytes, a stored name, a `-pN` worker header) so the self-check can be shown to catch it |
 | `NZ_TEST_Q56_ISOLATED=1` | tests only: `a`'s worker streams, run on several threads, do not inherit the dictionary table from the streams before them ([quirk 56](docs/ORIGINAL_QUIRKS.md)), so a test can show that its inputs depend on that inheritance |
 
@@ -224,12 +241,25 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
 Produces `bin/nz-re`; Release is the default build type since v0.15.0-pre (a build with no `-O` flag
 ran 4-5× slower). Each release ships four static binaries (Linux and Windows, 64- and 32-bit) with
-`SHA256SUMS.txt`, built as `g++ -std=c++17 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows). `-D_FILE_OFFSET_BITS=64` is required: with a 32-bit `off_t` an archive over 2 GB cannot even be measured, so the code refuses to compile without it.
+`SHA256SUMS.txt`, built as `g++ -std=c++17 -O2 -DNDEBUG -D_FILE_OFFSET_BITS=64 -Iinclude -static -pthread -o nz-re src/*.cpp` (and the mingw-w64 equivalents for Windows); `tools/release/build.sh <version> <nz_w32c.sfx>` builds all four
+and the two Windows zips. `-D_FILE_OFFSET_BITS=64` is required: with a 32-bit `off_t` an archive over 2 GB cannot even be measured, so the code refuses to compile without it.
 
-**Minimum Windows version: Vista (NT 6.0).** The `.exe` builds pin `_WIN32_WINNT=0x0600` and declare
-subsystem 6.00, so an older machine gets a clean refusal. They import only `kernel32.dll` and
-`msvcrt.dll`; their only Vista-era entry points are the four `CONDITION_VARIABLE` functions libstdc++ pulls
-in through `<filesystem>`. Older Windows cannot be tested here, so it is not claimed. Linux builds have no such floor.
+**Minimum Windows version: XP SP3 for the 32-bit `.exe`, Vista (NT 6.0) for the 64-bit one.** Since
+v0.18.0 the 32-bit build declares subsystem 5.01 and is built with `NZ_XP_COMPAT`
+(`src/nz_xp_compat.cpp`): mingw-w64's libstdc++ in the win32 thread model implements `std::thread`
+and `std::condition_variable` on the `CONDITION_VARIABLE` functions and `GetThreadId`, which XP does
+not have -- XP refused the earlier `.exe` outright ("not a valid Win32 application") -- so the build
+supplies those five itself, using the real ones on Vista and later and, on XP, condition variables
+made of per-waiter events. (Not the POSIX-threads mingw-w64 compiler: its emulated TLS runs
+`thread_local` destructors over storage it has already released, measured in 1199 of 1200 cases, and
+made about one `t` in 25 of a 4-stream `-cD` archive fail.) Checked on a real Windows XP SP3: the
+release package reads back, all eight methods compress and extract identically, and the archives are
+the same bytes the Vista-only build writes. The 64-bit `.exe` keeps subsystem 6.00. Both import only
+`kernel32.dll` and `msvcrt.dll`. Linux builds have no such floor.
+
+The 32-bit Windows build is linked `--large-address-aware` (since v0.18.0), as the original's 32-bit
+`nz.exe` is: on 64-bit Windows it gets 4 GB of address space instead of 2, which large `-m` settings
+need (`a -cc -m1500m` ran out of memory before).
 
 The 32-bit builds add `-m32 -msse2`, which compiles the SSE2 paths (audio predictor, `-cO` mixer): a 19 % shorter `-cO` decode on a 137 MB mixed tar, for a Pentium 4-class minimum (the original needed MMX).
 
