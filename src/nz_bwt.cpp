@@ -1596,13 +1596,45 @@ uint32_t NzBwtEncodeInput(const uint8_t* bwt, uint32_t n, uint32_t cap, std::vec
     if (n < 8u) return 0;
     if (cap < n * 5u + 0x41000u) return 0;
     // Single-threaded (DAT_08183620 == 0, every -t1 run) the whole block is ONE
-    // bucket, symbol 0; the split by leading symbol is the multi-threaded
-    // layout and is not written yet.
+    // bucket, symbol 0. Above one thread the block is split for the pool: the
+    // histogram of the BWT output (FUN_080ae940) gives one range per byte value,
+    // and neighbouring ranges are merged until a range holds max(n / threads,
+    // 0x40000) bytes, the last range merging into the one before it while what
+    // is left is under half that. A boundary that falls inside a run of equal
+    // bytes is first moved to the end of the run. A merged range is recorded at
+    // its LAST byte value (the table's empty runs cover the ones before it).
     uint32_t count[256] = {0};
     if (threads <= 1u) {
         count[0] = n;
     } else {
-        return 0;
+        for (uint32_t i = 0; i < n; ++i) ++count[bwt[i]];
+        const uint32_t per = n / threads;
+        const uint32_t target = (per < 0x40000u) ? 0x40000u : per;
+        const uint32_t half = target >> 1;
+        uint32_t run = count[0], pos = count[0];
+        for (uint32_t c = 1; c < 256u; ++c) {
+            uint32_t x = count[c];
+            if (run != 0u && x != 0u && bwt[pos] == bwt[pos - 1u]) {
+                const uint8_t edge = bwt[pos];
+                uint32_t prev = count[c - 1u];
+                bool emptied = false;
+                do {
+                    --x; ++prev; ++run; ++pos;
+                    if (x == 0u) { emptied = true; break; }
+                } while (bwt[pos] == edge);
+                count[c] = x;
+                count[c - 1u] = prev;
+                (void)emptied;
+            }
+            const uint32_t grown = run + x;
+            pos += x;
+            run = x;
+            if (grown < target || (n - pos) < half) {
+                count[c - 1u] = 0u;
+                count[c] = grown;
+                run = grown;
+            }
+        }
     }
     uint32_t nonempty = 0;
     for (uint32_t c = 0; c < 256u; ++c) nonempty += (count[c] != 0u);

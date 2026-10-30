@@ -1,5 +1,6 @@
 // nz_optimum_text.cpp -- see the header.
 #include "nz_optimum_text.h"
+#include "nz_optimum_seg.h"
 #include "nz_env.h"
 #include "nz_lzhd_text.h"
 #include "nz_cd_texttransform_dict.h"
@@ -453,7 +454,7 @@ bool CoTrialGate(const std::uint8_t* buf, std::uint32_t n, std::uint32_t mask, b
     std::vector<std::uint8_t> bwt(sample + 4u), payload;
     // baseline: the sample as it is, or its own size when it does not compress
     NzBwtTransform(buf, sample, bwt.data());
-    std::uint32_t baseline = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, payload);
+    std::uint32_t baseline = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, payload, nzr::opt_enc::EngineThreads());
     if (baseline == 0u) baseline = sample;
     // candidate: the sample through the pipeline, plus its side streams
     std::uint32_t candidate = sample;
@@ -466,7 +467,7 @@ bool CoTrialGate(const std::uint8_t* buf, std::uint32_t n, std::uint32_t mask, b
     if (t != 0u) {
         bwt.assign(t + 4u, 0);
         NzBwtTransform(pa, t, bwt.data());
-        const std::uint32_t c = NzBwtEncodeInput(bwt.data(), t, 0x600487u, payload);
+        const std::uint32_t c = NzBwtEncodeInput(bwt.data(), t, 0x600487u, payload, nzr::opt_enc::EngineThreads());
         if (c != 0u) candidate = c + CoSideStreamBytes(applied, tt2, tt16, &side);
     }
     const bool refuse = baseline <= candidate + (candidate >> 10);

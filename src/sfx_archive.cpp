@@ -23,6 +23,7 @@
 #include <atomic>
 #include <exception>
 #include <condition_variable>
+#include <deque>
 #include <cerrno>
 #include <cpuid.h>
 #include <memory>
@@ -205,17 +206,20 @@ std::uint32_t UpdateCrc32(std::uint32_t crc, const unsigned char* data, std::siz
 }
 
 std::uint32_t UpdateCrc16(std::uint32_t crc, const unsigned char* data, std::size_t size) {
-    std::uint32_t x = crc;
-    for (std::size_t i = 0; i < size; ++i) {
-        x ^= static_cast<std::uint32_t>(data[i]);
-        for (unsigned bit = 0; bit < 8; ++bit) {
-            if ((x & 1u) != 0u) {
-                x = (x >> 1u) ^ 0xa001u;
-            } else {
-                x >>= 1u;
-            }
+    // A byte at a time through a table (issue #3: it went bit by bit). Exact for
+    // the whole 32-bit state too: eight bit steps shift the bits above the low
+    // byte down by eight and XOR in a value that depends on the low byte alone.
+    static const std::array<std::uint16_t, 256> table = [] {
+        std::array<std::uint16_t, 256> t{};
+        for (std::uint32_t i = 0; i < 256u; ++i) {
+            std::uint32_t x = i;
+            for (unsigned bit = 0; bit < 8; ++bit) x = (x & 1u) ? (x >> 1u) ^ 0xa001u : (x >> 1u);
+            t[i] = static_cast<std::uint16_t>(x);
         }
-    }
+        return t;
+    }();
+    std::uint32_t x = crc;
+    for (std::size_t i = 0; i < size; ++i) x = (x >> 8u) ^ table[(x ^ data[i]) & 0xffu];
     return x & 0xffffu;
 }
 
@@ -1666,9 +1670,10 @@ public:
         const long pg = ::sysconf(_SC_PAGESIZE);
         granularity_ = pg > 0 ? static_cast<std::uint64_t>(pg) : 4096u;
 #endif
-        ++generation_;
+        generation_ = NextGeneration();   // unique across files: a new file at a freed one's address is not it
         return true;
     }
+    static std::uint64_t NextGeneration() { static std::atomic<std::uint64_t> g{0}; return ++g; }
     void Close() {
         DropAllThreadWindows();
 #if defined(_WIN32)
@@ -1694,7 +1699,6 @@ public:
         if (!open() || off > size_ || len > size_ - off) return nullptr;
         if (len == 0u) len = 1u;               // a zero-length range still needs a place
         Cache& c = ThreadCache();
-        if (c.owner != this || c.generation != generation_) { c.Drop(); c.owner = this; c.generation = generation_; }
         for (std::size_t i = 0; i < kWindowsPerThread; ++i) {
             Win& w = c.w[i];
             if (w.p != nullptr && off >= w.base && off + len <= w.base + w.len) {
@@ -1710,8 +1714,6 @@ private:
     struct Cache {
         Win w[kWindowsPerThread];
         std::uint64_t tick = 0;
-        WindowedFile* owner = nullptr;
-        std::uint64_t generation = 0;
         void Drop() {
             for (Win& x : w) {
                 if (x.p != nullptr) {
@@ -1723,39 +1725,59 @@ private:
                 }
                 x = Win{};
             }
-            tick = 0; owner = nullptr; generation = 0;
+            tick = 0;
         }
-        ~Cache() { Drop(); Unregister(this); }
     };
 
-    // Every live thread cache, so Close() can drop the windows of threads that
-    // are still alive (the decode pool outlives one archive).
+    // A thread's windows of one file live in a Cache that the FILE owns (in the
+    // registry below); the thread keeps only a plain pointer to it. They used to
+    // be a `static thread_local Cache` whose destructor unmapped the windows at
+    // thread exit -- and with the POSIX-threads mingw build (the XP one) that
+    // destructor ran over storage the emulated TLS had already given back, so a
+    // window another thread was reading could be unmapped under it: about 4 % of
+    // `t` of a 4-stream -cD archive failed with "Internal error: 21231532!",
+    // never with the win32-threads build or on Linux. Now the windows go when
+    // the file closes or the decode worker says it is done (ReleaseThreadWindows).
+    struct ThreadSlot { Cache* cache; const WindowedFile* owner; std::uint64_t generation; };
+    static ThreadSlot& Slot() { static thread_local ThreadSlot s{nullptr, nullptr, 0}; return s; }
     static std::mutex& CachesMutex() { static std::mutex m; return m; }
-    static std::vector<Cache*>& Caches() { static std::vector<Cache*> v; return v; }
-    static void Unregister(Cache* c) {
+    // every cache, with the file and the opening it serves
+    struct Entry { std::unique_ptr<Cache> cache; const WindowedFile* owner; std::uint64_t generation; };
+    static std::vector<Entry>& Caches() { static std::vector<Entry> v; return v; }
+    Cache& ThreadCache() {
+        ThreadSlot& s = Slot();
+        if (s.cache != nullptr && s.owner == this && s.generation == generation_) return *s.cache;
         std::lock_guard<std::mutex> lk(CachesMutex());
-        std::vector<Cache*>& v = Caches();
-        v.erase(std::remove(v.begin(), v.end(), c), v.end());
-    }
-    static Cache& ThreadCache() {
-        static thread_local Cache c;
-        static thread_local bool registered = [] {
-            std::lock_guard<std::mutex> lk(CachesMutex());
-            return true;
-        }();
-        (void)registered;
-        static thread_local bool listed = [&] {
-            std::lock_guard<std::mutex> lk(CachesMutex());
-            Caches().push_back(&c);
-            return true;
-        }();
-        (void)listed;
-        return c;
+        Caches().push_back({std::make_unique<Cache>(), this, generation_});
+        s.cache = Caches().back().cache.get();
+        s.owner = this;
+        s.generation = generation_;
+        return *s.cache;
     }
     void DropAllThreadWindows() {
         std::lock_guard<std::mutex> lk(CachesMutex());
-        for (Cache* c : Caches()) if (c->owner == this) c->Drop();
+        std::vector<Entry>& v = Caches();
+        for (Entry& e : v) if (e.owner == this) e.cache->Drop();
+        v.erase(std::remove_if(v.begin(), v.end(), [this](const Entry& e) { return e.owner == this; }), v.end());
     }
+
+public:
+    // The calling thread is done with whatever file it was reading: its windows
+    // are unmapped and its cache freed (a decode worker, before it returns).
+    static void ReleaseThreadWindows() {
+        ThreadSlot& s = Slot();
+        if (s.cache == nullptr) return;
+        {
+            std::lock_guard<std::mutex> lk(CachesMutex());
+            std::vector<Entry>& v = Caches();
+            for (std::size_t i = 0; i < v.size(); ++i) {
+                if (v[i].cache.get() == s.cache) { v[i].cache->Drop(); v.erase(v.begin() + static_cast<std::ptrdiff_t>(i)); break; }
+            }
+        }
+        s = ThreadSlot{nullptr, nullptr, 0};
+    }
+
+private:
 
     const unsigned char* MapInto(Cache& c, std::uint64_t off, std::uint64_t len) {
         const std::uint64_t base = (off / granularity_) * granularity_;
@@ -3333,16 +3355,13 @@ unsigned StageCheck255(const std::uint8_t* p, std::size_t n) {
     // packed s1<<16|s2) reduced modulo 255. Verified on five stage buffers of two
     // codecs (GDB: FUN_080c0220 pops the last staged byte and compares it with
     // checksum(stage) % 0xff).
+    // It is the archive checksum's Fletcher-32 itself, so it goes through the
+    // same deferred-modulo, SSE2 routine (issue #3: two divisions a word here).
     std::uint32_t s1 = 0, s2 = 0;
-    std::size_t i = 0;
-    for (; i + 1 < n; i += 2) {
-        const std::uint32_t w = static_cast<std::uint32_t>(p[i]) | (static_cast<std::uint32_t>(p[i + 1]) << 8);
-        s1 = (s1 + w) % 0xffffu; s2 = (s2 + s1) % 0xffffu;
-    }
-    if (i < n) { s1 = (s1 + p[i]) % 0xffffu; s2 = (s2 + s1) % 0xffffu; }
-    if (s1 == 0u) s1 = 0xffffu;
-    if (s2 == 0u) s2 = 0xffffu;
-    return static_cast<unsigned>(((s1 << 16) | s2) % 255u);
+    std::uint8_t pending = 0;
+    bool has_pending = false;
+    UpdateFletcher32(&s1, &s2, &pending, &has_pending, p, n);
+    return FinalizeFletcher32(s1, s2, pending, has_pending) % 255u;
 }
 
 // NZ_SAFE=1: instead of the original's behaviour on a damaged archive (write
@@ -4078,7 +4097,8 @@ bool ParallelForEach(std::size_t n, const std::function<bool(std::size_t)>& fn) 
     };
     std::vector<std::thread> pool;
     pool.reserve(threads - 1u);
-    for (std::size_t k = 1; k < threads; ++k) pool.emplace_back(worker);
+    // a worker's archive windows go with it (see WindowedFile::ReleaseThreadWindows)
+    for (std::size_t k = 1; k < threads; ++k) pool.emplace_back([&worker] { worker(); WindowedFile::ReleaseThreadWindows(); });
     worker();
     for (auto& th : pool) th.join();
     if (oom) throw std::bad_alloc();
@@ -5793,6 +5813,20 @@ static void ConfigureOptimumModels(std::uint32_t p0, nzr::audio::NzAudioPred& au
 std::size_t LegacySfxDataOffset(const unsigned char* b, std::size_t n);
 void StageMark(const char* what);
 
+// The -cc model sizes from its codec record (type 11, p0 = 7): the hash bits in
+// the fourth byte's nibbles, the window from p1 as a byte-float in 64 KB units.
+// The parser and the self-check that runs during `a` read them the same way.
+static void CmParamsFromCodecRecord(unsigned char p1, unsigned char cd_byte, int* a_bits, int* b_bits,
+                                    std::uint32_t* window) {
+    *a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
+    *b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
+    const unsigned xp1 = static_cast<unsigned>(p1) + 1u;
+    unsigned m = xp1 & 0x0fu;
+    const unsigned sh = xp1 >> 4u;
+    if (sh) m = (m + 16u) << (sh - 1u);
+    *window = m << 16u;
+}
+
 bool TryParseLegacyCnArchive(
     const std::string& archive_path,
     LegacyCnContext* out_context,
@@ -6093,16 +6127,8 @@ bool TryParseLegacyCnArchive(
             // f(window from p1, primary = max(block from p2, 1 MB)).
             method_p2 = (csize >= 3u) ? bytes[pos + 2u] : 0u;
             // CM (p0=7, size>=4): payload[2]=B (unused), payload[3]=CD.
-            if (method == 0x4bu && method_p0 == 7u && csize >= 4u) {
-                const unsigned char cd_byte = bytes[pos + 3u];
-                cm_a_bits = static_cast<int>((cd_byte >> 4u) + 20u);
-                cm_b_bits = static_cast<int>((cd_byte & 0x0fu) + 18u);
-                const unsigned xp1 = static_cast<unsigned>(method_p1) + 1u;
-                unsigned m = xp1 & 0x0fu;
-                const unsigned s = xp1 >> 4u;
-                if (s) m = (m + 16u) << (s - 1u);
-                cm_window_size = m << 16u;
-            }
+            if (method == 0x4bu && method_p0 == 7u && csize >= 4u)
+                CmParamsFromCodecRecord(method_p1, bytes[pos + 3u], &cm_a_bits, &cm_b_bits, &cm_window_size);
             pos += csize;
             found_codec = true;
         }
@@ -9418,138 +9444,26 @@ static std::uint32_t OptimumExpandGrow(std::uint32_t cap, std::uint32_t limit) {
 // Parses the stream_tag varint + one or more per-block headers (payload_size,
 // decr_param, param6, size18, staged_checksum_count, param2..dece_param) that
 // immediately follow it, and feeds each block to CM_Decode.
-static bool TryDecodeLegacyCm(
-    const LegacyCnContext& legacy,
-    // Count-and-sink or buffer, like the optimum family: a -cc entry's output
-    // can be gigabytes, and holding it here (and then again in the context, and
-    // again in the extractor) is what made a 4.5 GB one cost 13 GB where the
-    // original uses 554 MB.
-    OptimumOut* out_data,
-    std::string* out_error_message) {
-    progress::Scope pscope;
-    if (out_data == nullptr) return false;
-    out_data->Clear();
-
-    if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
-    const ByteBuffer& payload_flat = legacy.PayloadFlat();
-    if (payload_flat.empty()) return false;
-
-    const auto* raw = payload_flat.data();
-    const std::size_t raw_len = payload_flat.size();
-
-    // Create the CM decoder once; its state persists across all data chunks.
-    NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
-    // One audio predictor for the whole entry, matching the reference's single
-    // global. Reset rules are applied per block below.
-    nzr::audio::NzAudioPred aud;
-    // Inter-channel stage selector, from the decoder object's flag byte in the
-    // real binary (GDB-read at FUN_080a5330's entry): -cO 0x03, -cc 0x0f,
-    // -co 0x13. Only bit 4 is consulted; see NzAudioPred::SetContextFlags.
-    aud.SetContextFlags(0x0fu);      // -cc
+// -cc's audio predictor and image model profiles. Inter-channel stage selector
+// from the decoder object's flag byte in the real binary (GDB-read at
+// FUN_080a5330's entry): -cO 0x03, -cc 0x0f, -co 0x13 (only bit 4 is consulted,
+// see NzAudioPred::SetContextFlags); the image profile GDB-read at FUN_080a90c0's
+// entry (see nz_audio.h).
+static void ConfigureCmSideModels(nzr::audio::NzAudioPred& aud, nzr::audio::NzImageModel& img) {
+    aud.SetContextFlags(0x0fu);
     aud.SetPlaneOrders(384u, 16u, 8u);
     aud.SetStereoParam(16u);
-    // The image model (decr_param 3), one per entry; its state is never reset.
-    // Profile GDB-read at FUN_080a90c0's entry for -cc (see nz_audio.h).
-    nzr::audio::NzImageModel img;
     img.Configure(0x0fu, 32u, 48u, false);
-    // One exe filter for the whole entry. Its recent-target caches and base
-    // persist across a RUN of consecutive dece blocks and reset as soon as a
-    // block without dece intervenes -- see nz_exefilter.h. The reference's
-    // per-block temporary is wrong on 22 of 88 real dece archives.
-    NzExeFilter exe;
-    if (!cm) {
-        if (out_error_message) *out_error_message = "cm: allocation failed";
-        return false;
-    }
-    // One work budget for the whole entry, generous against what a valid stream
-    // needs (8 bit decodes per output byte) and bounded by the DECLARED output
-    // rather than by the chunk count a corrupt header can invent.
-    NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
-                             (1u << 20));
-    // The encoder-direction mirror for NZCC_RECODE (owned here, freed with cm).
-    NzCmDecoder* cm_mirror = nullptr;
-    if (NZ_ENV("NZCC_RECODE") != nullptr)
-        cm_mirror = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
-    out_data->Reserve(legacy.total_data_size);
+}
+
+// One type-0 data record of a -cc stream, [pos, stream_end) of `raw`, decoded with
+// the stream's persistent state. TryDecodeLegacyCm walks the records through it;
+// the self-check that runs while `a` compresses feeds it each record as written.
+static bool DecodeLegacyCmChunk(const LegacyCnContext& legacy, OptimumOut* out_data, NzCmDecoder* cm,
+                                NzCmDecoder* cm_mirror, nzr::audio::NzAudioPred& aud,
+                                nzr::audio::NzImageModel& img, NzExeFilter& exe,
+                                const std::uint8_t* raw, std::size_t& pos, std::size_t stream_end) {
     bool ok = true;
-    std::size_t pos = 0;
-
-    // Set when a type-5/6/7 checksum record turns up mid-stream rather than in the
-    // front metadata run (see the chunk_type != 0 branch below).
-    std::uint32_t inline_checksum = 0;
-    bool inline_checksum_seen = false;
-
-    // Outer loop over consecutive type-0 data chunks. Large -cc archives split the
-    // payload into multiple chunks; the CM state carries across them (a block with
-    // decr_param != 1 does not reset). Each chunk header is a biased varint
-    // (size<<4)|type; non-type-0 chunks (metadata) between data chunks are skipped.
-    // 64-bit compare: on a 32-bit build the cast turned a 4 823 005 184-byte
-    // total into 528 037 888, so the loop stopped a tenth of the way in and the
-    // size gate below then called a complete archive corrupt -- the same wrap
-    // the optimum family's segment loop had.
-    while (ok && pos < raw_len &&
-           static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
-        std::uint64_t stream_tag = 0;
-        {
-            unsigned shift = 7;
-            unsigned char c = raw[pos++];
-            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
-            while ((c & 0x80u) != 0u) {
-                if (pos >= raw_len || shift >= 63u) { ok = false; break; }
-                c = raw[pos++];
-                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
-                shift += 7u;
-            }
-        }
-        if (!ok) break;
-        std::uint32_t chunk_type = static_cast<std::uint32_t>(stream_tag & 0x0fu);
-        std::uint64_t chunk_size = stream_tag >> 4u;
-        if (chunk_type == 15u) {  // extended stream-id form
-            if (pos >= raw_len) { ok = false; break; }
-            unsigned r = raw[pos++];
-            if (r >= 0xf8u) {
-                if (pos >= raw_len) { ok = false; break; }
-                r = (r & 7u) + 8u * raw[pos++] + 248u;
-            }
-            chunk_type = r & 0x0fu;
-            if ((r >> 4) == 0u) chunk_type += 15u;
-        }
-        if (chunk_size > raw_len - pos) {
-            if (!legacy.truncated_input) { ok = false; break; }
-            chunk_size = static_cast<std::uint32_t>(raw_len - pos);   // cut-off last record (see the parser)
-        }
-        if (chunk_type != 0u) {
-            // Metadata chunk between data chunks. One of these can be the entry's
-            // CHECKSUM: it is a type-5 record, and it does NOT have to sit in the
-            // contiguous metadata run at the front of the archive. A large -cc
-            // archive emits an EMPTY type-5 placeholder up front and the real
-            // 4-byte one after its first data chunk, which the front-of-archive
-            // tag scan in TryParseLegacyCnArchive cannot see -- so the entry came
-            // out with has_checksum == false and the gate below declined a decode
-            // that was in fact byte-exact. Pick it up here instead.
-            if ((chunk_type == 5u || chunk_type == 6u || chunk_type == 7u) &&
-                !inline_checksum_seen) {
-                if (chunk_size == 4u) {
-                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
-                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u) |
-                                      (static_cast<std::uint32_t>(raw[pos + 2]) << 16u) |
-                                      (static_cast<std::uint32_t>(raw[pos + 3]) << 24u);
-                    inline_checksum_seen = true;
-                } else if (chunk_size == 2u) {
-                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
-                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u);
-                    inline_checksum_seen = true;
-                }
-                if (inline_checksum_seen && NZ_ENV("NZOPT_TRACE_TDO")) {
-                    fprintf(stderr, "[TDCC] inline type-%u checksum record: 0x%08x\n",
-                            chunk_type, inline_checksum);
-                }
-            }
-            pos += static_cast<std::size_t>(chunk_size);
-            continue;
-        }
-        const std::size_t stream_end = pos + static_cast<std::size_t>(chunk_size);
-
         while (pos < stream_end) {
         if (pos + 4u > stream_end) { ok = false; break; }
         const std::uint32_t payload_size =
@@ -9831,7 +9745,7 @@ static bool TryDecodeLegacyCm(
         const std::uint64_t prev_size = out_data->size();
         const std::uint32_t remaining = OptimumRemainingOut(legacy.total_data_size, prev_size);
 
-        nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u);
+        nz_trace::Construct("cc_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x in=%u out=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, payload_size, cur_size);
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDCC] pre-filters: decr_param=%u param6=%u param2_flag=%u param1_flag=%u "
                             "tt_enabled=%u tt_flags=%u out_size=%u pos=%zu stream_end=%zu\n",
@@ -10094,6 +10008,135 @@ static bool TryDecodeLegacyCm(
         out_data->Append(work.data(), cur_size);
         progress::Add(cur_size);
         }
+    return ok;
+}
+
+static bool TryDecodeLegacyCm(
+    const LegacyCnContext& legacy,
+    // Count-and-sink or buffer, like the optimum family: a -cc entry's output
+    // can be gigabytes, and holding it here (and then again in the context, and
+    // again in the extractor) is what made a 4.5 GB one cost 13 GB where the
+    // original uses 554 MB.
+    OptimumOut* out_data,
+    std::string* out_error_message) {
+    progress::Scope pscope;
+    if (out_data == nullptr) return false;
+    out_data->Clear();
+
+    if (legacy.legacy_method != 0x4bu || legacy.legacy_method_p0 != 7u) return false;
+    const ByteBuffer& payload_flat = legacy.PayloadFlat();
+    if (payload_flat.empty()) return false;
+
+    const auto* raw = payload_flat.data();
+    const std::size_t raw_len = payload_flat.size();
+
+    // Create the CM decoder once; its state persists across all data chunks.
+    NzCmDecoder* cm = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    // One audio predictor for the whole entry, matching the reference's single
+    // global. Reset rules are applied per block below.
+    nzr::audio::NzAudioPred aud;
+    // The image model (decr_param 3), one per entry; its state is never reset.
+    nzr::audio::NzImageModel img;
+    ConfigureCmSideModels(aud, img);
+    // One exe filter for the whole entry. Its recent-target caches and base
+    // persist across a RUN of consecutive dece blocks and reset as soon as a
+    // block without dece intervenes -- see nz_exefilter.h. The reference's
+    // per-block temporary is wrong on 22 of 88 real dece archives.
+    NzExeFilter exe;
+    if (!cm) {
+        if (out_error_message) *out_error_message = "cm: allocation failed";
+        return false;
+    }
+    // One work budget for the whole entry, generous against what a valid stream
+    // needs (8 bit decodes per output byte) and bounded by the DECLARED output
+    // rather than by the chunk count a corrupt header can invent.
+    NzCmSetBitBudget(cm, static_cast<std::uint64_t>(legacy.total_data_size) * 16u +
+                             (1u << 20));
+    // The encoder-direction mirror for NZCC_RECODE (owned here, freed with cm).
+    NzCmDecoder* cm_mirror = nullptr;
+    if (NZ_ENV("NZCC_RECODE") != nullptr)
+        cm_mirror = NzCmCreate(legacy.cm_a_bits, legacy.cm_b_bits, legacy.cm_window_size);
+    out_data->Reserve(legacy.total_data_size);
+    bool ok = true;
+    std::size_t pos = 0;
+
+    // Set when a type-5/6/7 checksum record turns up mid-stream rather than in the
+    // front metadata run (see the chunk_type != 0 branch below).
+    std::uint32_t inline_checksum = 0;
+    bool inline_checksum_seen = false;
+
+    // Outer loop over consecutive type-0 data chunks. Large -cc archives split the
+    // payload into multiple chunks; the CM state carries across them (a block with
+    // decr_param != 1 does not reset). Each chunk header is a biased varint
+    // (size<<4)|type; non-type-0 chunks (metadata) between data chunks are skipped.
+    // 64-bit compare: on a 32-bit build the cast turned a 4 823 005 184-byte
+    // total into 528 037 888, so the loop stopped a tenth of the way in and the
+    // size gate below then called a complete archive corrupt -- the same wrap
+    // the optimum family's segment loop had.
+    while (ok && pos < raw_len &&
+           static_cast<std::uint64_t>(out_data->size()) < legacy.total_data_size) {
+        std::uint64_t stream_tag = 0;
+        {
+            unsigned shift = 7;
+            unsigned char c = raw[pos++];
+            stream_tag = static_cast<std::uint64_t>(c & 0x7fu);
+            while ((c & 0x80u) != 0u) {
+                if (pos >= raw_len || shift >= 63u) { ok = false; break; }
+                c = raw[pos++];
+                stream_tag += (static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift);
+                shift += 7u;
+            }
+        }
+        if (!ok) break;
+        std::uint32_t chunk_type = static_cast<std::uint32_t>(stream_tag & 0x0fu);
+        std::uint64_t chunk_size = stream_tag >> 4u;
+        if (chunk_type == 15u) {  // extended stream-id form
+            if (pos >= raw_len) { ok = false; break; }
+            unsigned r = raw[pos++];
+            if (r >= 0xf8u) {
+                if (pos >= raw_len) { ok = false; break; }
+                r = (r & 7u) + 8u * raw[pos++] + 248u;
+            }
+            chunk_type = r & 0x0fu;
+            if ((r >> 4) == 0u) chunk_type += 15u;
+        }
+        if (chunk_size > raw_len - pos) {
+            if (!legacy.truncated_input) { ok = false; break; }
+            chunk_size = static_cast<std::uint32_t>(raw_len - pos);   // cut-off last record (see the parser)
+        }
+        if (chunk_type != 0u) {
+            // Metadata chunk between data chunks. One of these can be the entry's
+            // CHECKSUM: it is a type-5 record, and it does NOT have to sit in the
+            // contiguous metadata run at the front of the archive. A large -cc
+            // archive emits an EMPTY type-5 placeholder up front and the real
+            // 4-byte one after its first data chunk, which the front-of-archive
+            // tag scan in TryParseLegacyCnArchive cannot see -- so the entry came
+            // out with has_checksum == false and the gate below declined a decode
+            // that was in fact byte-exact. Pick it up here instead.
+            if ((chunk_type == 5u || chunk_type == 6u || chunk_type == 7u) &&
+                !inline_checksum_seen) {
+                if (chunk_size == 4u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 2]) << 16u) |
+                                      (static_cast<std::uint32_t>(raw[pos + 3]) << 24u);
+                    inline_checksum_seen = true;
+                } else if (chunk_size == 2u) {
+                    inline_checksum = static_cast<std::uint32_t>(raw[pos]) |
+                                      (static_cast<std::uint32_t>(raw[pos + 1]) << 8u);
+                    inline_checksum_seen = true;
+                }
+                if (inline_checksum_seen && NZ_ENV("NZOPT_TRACE_TDO")) {
+                    fprintf(stderr, "[TDCC] inline type-%u checksum record: 0x%08x\n",
+                            chunk_type, inline_checksum);
+                }
+            }
+            pos += static_cast<std::size_t>(chunk_size);
+            continue;
+        }
+        const std::size_t stream_end = pos + static_cast<std::size_t>(chunk_size);
+
+        ok = DecodeLegacyCmChunk(legacy, out_data, cm, cm_mirror, aud, img, exe, raw, pos, stream_end);
     }
 
     NzCmDestroy(cm);
@@ -11121,7 +11164,7 @@ static bool DecodeOptimumBlockSequence(
         if (stage_idx == staged.size() && stage_bad) { nzr::derr::SetAt(stage_bad_code, pos); if (trace_blocks) fprintf(stderr, "[TDO] stop line %d pos=%zu end=%zu out=%zu\n", __LINE__, pos, stream_end, out_data->size()); ok = false; break; }
         out_data->Append(work.data(), cur_size);
         progress::Add(cur_size);
-        nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag);
+        nz_trace::Construct("optimum_block decr=%u param6=%u p2=%u p1=%u tt=0x%02x dece=%u p14=%u p15=%u out=%u", decr_param, param6, param2_flag, param1_flag, tt_enabled ? tt_flags : 0u, dece_param, param14_flag, param15_flag, cur_size);
         if (NZ_ENV("NZOPT_TRACE_TDO")) {
             fprintf(stderr, "[TDO] after postfilters: cur_size=%u total_out_data=%zu total_data_size=%llu param2_flag=%u param1_flag=%u tt_enabled=%u tt_flags=%u dece_param=%u\n",
                     cur_size, out_data->size(), (unsigned long long)total_size_hint,
@@ -13673,7 +13716,7 @@ static bool OptimumBlockIsLz(const std::uint8_t* data, std::uint32_t n) {
     if (lz == 0u) lz = sample;
     std::vector<std::uint8_t> bwt(sample + 4u), bpay;
     NzBwtTransform(data, sample, bwt.data());
-    const std::uint32_t b = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, bpay);
+    const std::uint32_t b = NzBwtEncodeInput(bwt.data(), sample, 0x600487u, bpay, nzr::opt_enc::EngineThreads());
     if (NZ_ENV("NZOPT_TRACE_TDO"))
         std::fprintf(stderr, "[tdo] kind n=%u sample=%u lz=%u bwt=%u -> %s\n", n, sample, lz, b,
                      (b == 0u ? (lz < sample) : (lz < b)) ? "LZ" : "BWT");
@@ -14179,7 +14222,7 @@ static bool OptimumEncodeSegment(Engine& co, Engine* verifier, NzExeFilterEnc& e
             // frozen at a 1 MB block. With a bigger block the bucket coder
             // refused outright (its own `cap < n * 5 + ...` guard) and the block
             // went out STORED -- a 1.9 MB .pbm the original codes 18x smaller.
-            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, block_size * 5u + 0x100487u, payload);
+            const std::uint32_t psz = NzBwtEncodeInput(bwt.data(), m, block_size * 5u + 0x100487u, payload, nzr::opt_enc::EngineThreads());
             if (psz == 0u) {
                 // STORED: the bucket coder could not get under the BWT string's
                 // own size, so the block carries it raw. param6 == 0, and then
@@ -14549,6 +14592,280 @@ static bool CmEncodeSegment(NzCmDecoder* cm, NzExeFilterEnc& exe_enc,
     return true;
 }
 
+// The self-check WHILE `a` compresses (since v0.18.0): one per stream of a codec
+// it knows how to follow, on its own thread. The writer hands it every byte of
+// the stream as it goes to the file; it splits them into records the way the
+// reader does, takes the model sizes from the stream's own codec record, and
+// decodes each data record with the reader's own block decoder the moment it is
+// complete -- so the decode overlaps the compression instead of following it.
+// What comes out is measured (length and CRC-64) against what was read. The
+// container itself is then checked once the file is closed (SelfCheckStructure).
+// -cc, -co and -cO; the other codecs keep the check after the fact.
+class LiveStreamCheck {
+public:
+    enum State { kRunning, kOk, kFailed, kSkipped };
+    struct Result {
+        State state = kRunning;
+        std::string reason;
+        std::uint64_t out_len = 0, out_crc = 0;   // what the records decode to
+        std::uint64_t fed_len = 0, fed_crc = 0;   // the bytes handed over
+    };
+
+    LiveStreamCheck(unsigned p0, std::uint64_t stream_total) : p0_(p0), total_(stream_total) {
+        crc_out_ = nzr::selfcheck::Crc64();
+        th_ = std::thread([this] { Run(); });
+    }
+    ~LiveStreamCheck() { (void)Wait(); }
+    LiveStreamCheck(const LiveStreamCheck&) = delete;
+    LiveStreamCheck& operator=(const LiveStreamCheck&) = delete;
+
+    static bool Handles(unsigned p0) { return p0 == 5u || p0 == 6u || p0 == 7u; }
+
+    void Feed(const unsigned char* p, std::size_t n) {
+        if (n == 0u) return;
+        std::unique_lock<std::mutex> lk(mu_);
+        // backpressure: the writer waits rather than letting the queue grow
+        space_.wait(lk, [&] { return queued_ < kMaxQueued || stop_; });
+        if (stop_) return;
+        q_.emplace_back(p, p + n);
+        queued_ += n;
+        ready_.notify_one();
+    }
+    // No more bytes; returns the verdict once every record is decoded.
+    const Result& Wait() {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            done_ = true;
+        }
+        ready_.notify_all();
+        if (th_.joinable()) th_.join();
+        return res_;
+    }
+
+private:
+    static constexpr std::size_t kMaxQueued = 64u << 20;
+
+    // the next queued piece, or false once the writer is done and the queue empty
+    bool Pop(std::vector<unsigned char>* out) {
+        std::unique_lock<std::mutex> lk(mu_);
+        ready_.wait(lk, [&] { return !q_.empty() || done_; });
+        if (q_.empty()) return false;
+        *out = std::move(q_.front());
+        q_.pop_front();
+        queued_ -= out->size();
+        space_.notify_all();
+        return true;
+    }
+    void Stop(State st, std::string why) {
+        res_.state = st;
+        res_.reason = std::move(why);
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_ = true;
+        q_.clear();
+        queued_ = 0;
+        space_.notify_all();
+    }
+
+    // One complete record at buf_[at..): its type, body offset and size, or false
+    // when the bytes for it have not all arrived.
+    bool NextRecord(std::size_t at, unsigned* type, std::size_t* body, std::uint64_t* size, bool* bad) const {
+        const std::size_t n = buf_.size();
+        std::size_t p = at;
+        if (p >= n) return false;
+        unsigned char c = buf_[p++];
+        std::uint64_t tag = c & 0x7fu;
+        unsigned shift = 7;
+        while ((c & 0x80u) != 0u) {
+            if (p >= n) return false;
+            if (shift >= 63u) { *bad = true; return false; }
+            c = buf_[p++];
+            tag += static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift;
+            shift += 7u;
+        }
+        unsigned t = static_cast<unsigned>(tag & 0x0fu);
+        const std::uint64_t sz = tag >> 4u;
+        if (t == 15u) {
+            if (p >= n) return false;
+            unsigned r = buf_[p++];
+            if (r >= 0xf8u) {
+                if (p >= n) return false;
+                r = (r & 7u) + 8u * buf_[p++] + 248u;
+            }
+            t = r & 0x0fu;
+            if ((r >> 4) == 0u) t += 15u;
+        }
+        if (sz > n - p) return false;
+        *type = t; *body = p; *size = sz;
+        return true;
+    }
+
+    void Run() {
+        NzCmDecoder* cm = nullptr;
+        struct CmFree { NzCmDecoder*& c; ~CmFree() { if (c) NzCmDestroy(c); } } cm_free{cm};
+        nzr::audio::NzAudioPred aud;
+        nzr::audio::NzImageModel img;
+        NzExeFilter exe;
+        if (p0_ == 7u) ConfigureCmSideModels(aud, img);
+        else ConfigureOptimumModels(p0_, aud, img);
+        // -co/-cO: the engine TryDecodeLegacyOptimum builds, set up from the codec record
+        std::unique_ptr<nzr::optimum::NzOptimumLzDecoder> co;
+        std::unique_ptr<nzr::optimum2::NzOptimum2LzDecoder> cO;
+        LegacyCnContext lctx;   // what DecodeLegacyCmChunk reads of the archive
+        lctx.total_data_size = total_;
+        nzr::selfcheck::Crc64 fed;
+        OptimumOut out([this](const unsigned char* p, std::size_t n) { crc_out_.Update(p, n); res_.out_len += n; });
+        std::vector<unsigned char> piece;
+        std::size_t at = 0;   // the next record's start in buf_
+        try {
+            nzr::derr::Clear();
+            while (Pop(&piece)) {
+                fed.Update(piece.data(), piece.size());
+                res_.fed_len += piece.size();
+                if (res_.state != kRunning) continue;
+                if (at != 0u) { buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(at)); at = 0; }
+                buf_.insert(buf_.end(), piece.begin(), piece.end());
+                unsigned type = 0; std::size_t body = 0; std::uint64_t size = 0; bool bad = false;
+                while (res_.state == kRunning && NextRecord(at, &type, &body, &size, &bad)) {
+                    const unsigned char* b = buf_.data() + body;
+                    if (type == 11u && p0_ != 7u && !co && !cO && b[0] == p0_) {
+                        // the block-size byte is the third: a record without it is
+                        // quirk 77's short worker header, which no reader can use
+                        if (size < 3u) { Stop(kFailed, "a worker header is short"); break; }
+                        const std::uint32_t window = nzr::optimum::NzOptimumLzWindowSizeFromP1(b[1]);
+                        if (window == 0u) { Stop(kFailed, "the codec record does not describe a window"); break; }
+                        if (p0_ == 5u) co = std::make_unique<nzr::optimum::NzOptimumLzDecoder>(window);
+                        else cO = std::make_unique<nzr::optimum2::NzOptimum2LzDecoder>(window);
+                    } else if (type == 0u && p0_ != 7u) {
+                        if (!co && !cO) { Stop(kFailed, "a data record before the codec record"); break; }
+                        const ByteView v(b, static_cast<std::size_t>(size));
+                        const bool good = co ? DecodeOptimumBlockSequence(v, 0u, size, total_, *co, aud, img, exe, &out)
+                                             : DecodeOptimumBlockSequence(v, 0u, size, total_, *cO, aud, img, exe, &out);
+                        if (!good) {
+                            const std::uint32_t code = nzr::derr::Current().code;
+                            Stop(kFailed, code != 0u ? "it does not decode (code " + std::to_string(code) + ")"
+                                                     : std::string("it does not decode"));
+                            break;
+                        }
+                    } else if (type == 11u && p0_ == 7u && cm == nullptr && b[0] == 7u) {
+                        if (size < 4u) { Stop(kFailed, "a worker header is short"); break; }
+                        int a_bits = 0, b_bits = 0; std::uint32_t window = 0;
+                        CmParamsFromCodecRecord(b[1], b[3], &a_bits, &b_bits, &window);
+                        cm = NzCmCreate(a_bits, b_bits, window);
+                        if (cm == nullptr) { Stop(kSkipped, "not enough memory to follow the stream"); break; }
+                        NzCmSetBitBudget(cm, total_ * 16u + (1u << 20));
+                    } else if (type == 0u && p0_ == 7u) {
+                        if (cm == nullptr) { Stop(kFailed, "a data record before the codec record"); break; }
+                        std::size_t pos = 0;
+                        if (!DecodeLegacyCmChunk(lctx, &out, cm, nullptr, aud, img, exe, b, pos,
+                                                 static_cast<std::size_t>(size))) {
+                            const std::uint32_t code = nzr::derr::Current().code;
+                            Stop(kFailed, code != 0u ? "it does not decode (code " + std::to_string(code) + ")"
+                                                     : std::string("it does not decode"));
+                            break;
+                        }
+                    }
+                    at = body + static_cast<std::size_t>(size);
+                }
+                if (bad && res_.state == kRunning) Stop(kFailed, "a record header does not parse");
+            }
+            if (res_.state == kRunning) {
+                if (at != buf_.size()) Stop(kFailed, "the stream ends inside a record");
+                else res_.state = kOk;
+            }
+        } catch (const std::bad_alloc&) {
+            Stop(kSkipped, "not enough memory to follow the stream");
+            Drain(&fed);
+        } catch (const std::length_error&) {
+            Stop(kSkipped, "not enough memory to follow the stream");
+            Drain(&fed);
+        } catch (const std::exception& ex) {
+            Stop(kFailed, std::string("the reader failed: ") + ex.what());
+            Drain(&fed);
+        }
+        nzr::derr::Clear();
+        res_.out_crc = crc_out_.Final();
+        res_.fed_crc = fed.Final();
+        std::vector<unsigned char>().swap(buf_);
+    }
+    // after a failure, let a waiting writer go and count what it still hands over
+    void Drain(nzr::selfcheck::Crc64* fed) {
+        std::vector<unsigned char> piece;
+        while (Pop(&piece)) { fed->Update(piece.data(), piece.size()); res_.fed_len += piece.size(); }
+    }
+
+    const unsigned p0_;
+    const std::uint64_t total_;
+    std::thread th_;
+    std::mutex mu_;
+    std::condition_variable ready_, space_;
+    std::deque<std::vector<unsigned char>> q_;
+    std::size_t queued_ = 0;
+    bool done_ = false, stop_ = false;
+    std::vector<unsigned char> buf_;
+    nzr::selfcheck::Crc64 crc_out_;
+    Result res_;
+};
+
+// What the live checks are fed: every byte written to the archive, after the
+// self-extractor's stub, split into records the way the reader splits them and
+// routed by the stream number in the record header -- so each check decodes
+// exactly the records the file holds, in the file's order, and nothing else.
+class LiveDemux {
+public:
+    void Route(unsigned stream, std::shared_ptr<LiveStreamCheck> c) {
+        if (stream >= dst_.size()) dst_.resize(stream + 1u);
+        dst_[stream] = std::move(c);
+    }
+    void Feed(const unsigned char* p, std::size_t n) {
+        if (n == 0u) return;
+        buf_.insert(buf_.end(), p, p + n);
+        std::size_t at = 0;
+        for (;;) {
+            unsigned stream = 0;
+            std::size_t end = 0;
+            if (!Next(at, &stream, &end)) break;
+            if (stream < dst_.size() && dst_[stream]) dst_[stream]->Feed(buf_.data() + at, end - at);
+            at = end;
+        }
+        if (at != 0u) buf_.erase(buf_.begin(), buf_.begin() + static_cast<std::ptrdiff_t>(at));
+    }
+    bool Clean() const { return buf_.empty() && !bad_; }   // no record left half-written
+private:
+    bool Next(std::size_t at, unsigned* stream, std::size_t* end) {
+        const std::size_t n = buf_.size();
+        std::size_t p = at;
+        if (p >= n || bad_) return false;
+        unsigned char c = buf_[p++];
+        std::uint64_t tag = c & 0x7fu;
+        unsigned shift = 7;
+        while ((c & 0x80u) != 0u) {
+            if (p >= n) return false;
+            if (shift >= 63u) { bad_ = true; return false; }
+            c = buf_[p++];
+            tag += static_cast<std::uint64_t>((c & 0x7fu) + 1u) << shift;
+            shift += 7u;
+        }
+        const std::uint64_t sz = tag >> 4u;
+        unsigned st = 0;
+        if ((tag & 0x0fu) == 15u) {
+            if (p >= n) return false;
+            unsigned r = buf_[p++];
+            if (r >= 0xf8u) {
+                if (p >= n) return false;
+                r = (r & 7u) + 8u * buf_[p++] + 248u;
+            }
+            st = r >> 4;
+        }
+        if (sz > n - p) return false;
+        *stream = st;
+        *end = p + static_cast<std::size_t>(sz);
+        return true;
+    }
+    std::vector<std::shared_ptr<LiveStreamCheck>> dst_;
+    std::vector<unsigned char> buf_;
+    bool bad_ = false;
+};
+
 struct EncodeCodec {
     unsigned p0 = 0;
     std::uint32_t co_window = 0;
@@ -14569,6 +14886,17 @@ struct EncodeCodec {
     NzExeFilterEnc exe_enc;
     int cm_a_bits = 22, cm_b_bits = 18;
     std::uint32_t co_block = 0x100000u;
+    // Above one thread the reader runs ahead of the compressor, in its own
+    // thread, by this stream's share of the read buffer (the banner's
+    // `IO-buffers: R+W`, R / workers each). The -co/-cO/-cc family writes a
+    // read's metadata (tables, checksums) before the NEXT data record, so the
+    // records land where the READER was, R bytes past what the codec asked for:
+    // measured with -br0/512k/1m/2m/3m on one 4 MB file, the checksum record
+    // moves block by block exactly as that predicts. 0: no reader thread (-t1).
+    std::uint64_t read_ahead = 0;
+    // The self-check that follows this stream while it is written (null: the
+    // check runs after the fact).
+    std::shared_ptr<LiveStreamCheck> live;
     // FUN_0808d0b0's 1 MB staging buffer and the block it assembles: STREAM
     // state, like the verifier above -- the block boundaries depend on what the
     // whole stream has fed it, not on where the reader's pieces fall.
@@ -14655,6 +14983,17 @@ struct EncodeCodec {
         return window + (p0 == 2u ? 0x4000000ull : 0x208000ull) + 0x200000ull + 0x210000ull;
     }
 };
+
+// The read buffer `a` sets up above one thread: -br, or the codec's automatic
+// figure (see PrintStoreEncodeHeader).
+std::uint64_t EncodeReadBufferBytes(const CliOptions& options) {
+    if (options.read_buffer_set) return options.read_buffer_bytes;
+    switch (options.compressor) {
+        case Compressor::kOptimum1: case Compressor::kOptimum2: return 4ull << 20u;
+        case Compressor::kCm: return 1ull << 20u;
+        default: return 20ull << 20u;
+    }
+}
 
 void PrintStoreEncodeHeader(std::ostream& os, const CliOptions& options, unsigned workers, std::uint64_t window, const EncodeCodec& codec,
                             bool archive_line_printed = false) {
@@ -14895,6 +15234,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
     std::ifstream in;
     std::size_t cur_met = 0; std::uint64_t cur_off = 0;   // reading cursor over `met`
     std::vector<unsigned char> block, iobuf(1u << 16u);
+    std::vector<unsigned char> ahead;   // the reader thread's lead (codec.read_ahead), from ahead_off
+    std::size_t ahead_off = 0;
     LegacyFileChecksum ck(ckmode);
     // Ghosts and 0-byte files at the reading cursor: the ghost is reported, the
     // empty file gets its (empty) checksum; both are passed without a read.
@@ -14997,8 +15338,14 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                                        ? 0x100000ull - codec.feeder.Held()
                                        : 0x100000ull;
         const std::uint64_t want = std::min<std::uint64_t>(chunked ? room : window, total - written);
-        while (block.size() < want && cur_met < met.size()) {
-            if (chunked && !block.empty() && ((cur_off == 0u && ghost_budget == 0u) || budget_end)) {
+        // With a reader thread (codec.read_ahead) the bytes are read into `ahead`
+        // until it holds what was asked for plus the read-ahead, and the piece is
+        // then taken from its front; the metadata below follows the reader.
+        const bool ra = chunked && codec.p0 >= 5u && codec.read_ahead > 0u;
+        std::vector<unsigned char>& sink = ra ? ahead : block;
+        const std::uint64_t lim = ra ? std::min<std::uint64_t>(total - written, want + codec.read_ahead) + ahead_off : want;
+        while (sink.size() < lim && cur_met < met.size()) {
+            if (chunked && sink.size() > (ra ? ahead_off : 0u) && ((cur_off == 0u && ghost_budget == 0u) || budget_end)) {
                 // the reader decides at an entry boundary looking at the next NON-EMPTY
                 // entry (a ghost counts with its size): zero-length entries between a
                 // piece and a piece-breaking file travel with the next piece's table
@@ -15021,14 +15368,14 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
                 pcrc = nzr::selfcheck::Crc64();
                 status.FileStart(live, e.display);
             }
-            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, want - block.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
+            const std::size_t n = static_cast<std::size_t>(std::min<std::uint64_t>({pc.len - cur_off, lim - sink.size(), iobuf.size(), ghost_budget != 0u ? ghost_budget : ~std::uint64_t{0}}));
             const auto t_read = std::chrono::steady_clock::now();
             in.read(reinterpret_cast<char*>(iobuf.data()), static_cast<std::streamsize>(n));
             *read_ms += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t_read).count());
             if (in.gcount() != static_cast<std::streamsize>(n)) { os << "Error: cannot read " << e.fs_path.string() << '\n'; return false; }
             ck.Update(iobuf.data(), n);
             pcrc.Update(iobuf.data(), n);
-            block.insert(block.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
+            sink.insert(sink.end(), iobuf.begin(), iobuf.begin() + static_cast<std::ptrdiff_t>(n));
             cur_off += n;
             if (cur_off == pc.len) {
                 piece_ck[piece_of[cur_met]] = ck.Final();
@@ -15038,6 +15385,18 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             if (ghost_budget != 0u) { ghost_budget -= n; if (ghost_budget == 0u) budget_end = true; }
         }
         budget_end = false;
+        // where the reader is: past this piece by what it holds in advance
+        const std::uint64_t read_end = written + (ra ? ahead.size() - ahead_off : block.size());
+        if (ra) {
+            const std::size_t take = static_cast<std::size_t>(std::min<std::uint64_t>(want, ahead.size() - ahead_off));
+            block.assign(ahead.begin() + static_cast<std::ptrdiff_t>(ahead_off),
+                         ahead.begin() + static_cast<std::ptrdiff_t>(ahead_off + take));
+            ahead_off += take;
+            if (ahead_off == ahead.size()) { ahead.clear(); ahead_off = 0; }
+            else if (ahead_off >= (std::size_t{1} << 22)) {
+                ahead.erase(ahead.begin(), ahead.begin() + static_cast<std::ptrdiff_t>(ahead_off)); ahead_off = 0;
+            }
+        }
         if (!chunked) pass_empty();
         else if (cur_off == 0u) {
             // FUN_08065a40 / FUN_0805b020: at a file boundary the reader stops when
@@ -15066,7 +15425,7 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
             const bool starts = !announced[k] && (chunked ? (consumed_lo <= k && k < consumed_hi)
                                                           : (piece_pos[k] < block_end || (pieces[k].len == 0u && piece_pos[k] <= block_end && cur_met > 0u)));
             if (starts) { announced[k] = true; a_from = std::min(a_from, k); a_to = std::max(a_to, k + 1u); }
-            const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= block_end;
+            const bool ends = !summed[k] && announced[k] && piece_pos[k] + pieces[k].len <= (ra ? read_end : block_end);
             if (ends) { summed[k] = true; c_from = std::min(c_from, k); c_to = std::max(c_to, k + 1u); }
         }
         if (a_from > a_to) a_from = a_to;
@@ -15148,7 +15507,8 @@ bool LegacyWriteStoreStream(std::vector<unsigned char>& out, unsigned stream, co
         out.insert(out.end(), hdr.begin(), hdr.end());
     }
     for (std::size_t k = 0; k < pieces.size(); ++k)
-        codec.expected.push_back({src[pieces[k].src].archive_name, pieces[k].file_off, pieces[k].len, piece_crc[k], true});
+        codec.expected.push_back({src[pieces[k].src].archive_name, pieces[k].file_off, pieces[k].len, piece_crc[k], true,
+                                  piece_ck[k], ckmode != ChecksumMode::kNone});
     return true;
 }
 
@@ -15249,6 +15609,71 @@ static SelfCheckOutcome SelfCheckWrittenArchive(const fs::path& path, const CliO
         if (g == got_runs.end() || g->second != kv.second) return fail("an entry decodes to other bytes: " + kv.first);
     }
     if (got_runs.size() != want_runs.size()) return fail("the decoded entries do not match the input");
+    return out;
+}
+
+// The other half of the check made while compressing: the decoders have
+// already been fed every data record as it went to the file, so what is left is
+// the container. (1) The file on disk is exactly what was written, byte for byte
+// (CRC-64 and length of what passed the tee); (2) the reader opens it and lists
+// the same entries, the same names with the same sizes; (3) every checksum the
+// listing carries for a whole file is the one the writer computed over what it
+// read.
+static SelfCheckOutcome SelfCheckStructure(const fs::path& path, const std::vector<nzr::selfcheck::Item>& expected,
+                                           std::uint64_t written_crc, std::uint64_t written_len) {
+    SelfCheckOutcome out;
+    const auto fail = [&](std::string why) { out.verdict = SelfCheckOutcome::kFailed; out.reason = std::move(why); return out; };
+    {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return fail("it does not open (Cannot open archive!)");
+        nzr::selfcheck::Crc64 c;
+        std::uint64_t n = 0;
+        std::vector<char> buf(1u << 20);
+        while (in) {
+            in.read(buf.data(), static_cast<std::streamsize>(buf.size()));
+            const std::streamsize got = in.gcount();
+            if (got <= 0) break;
+            c.Update(reinterpret_cast<const unsigned char*>(buf.data()), static_cast<std::size_t>(got));
+            n += static_cast<std::uint64_t>(got);
+        }
+        if (n != written_len || c.Final() != written_crc) return fail("the file on disk is not what was written");
+    }
+    std::string err;
+    std::map<std::string, std::uint64_t> entry_bytes;
+    std::vector<LegacyCnEntry> entries;
+    try {
+        nzr::derr::Clear();
+        LegacyCnContext ctx;
+        if (!TryParseLegacyCnArchive(NativeBytesFromPath(path), &ctx, &err)) {
+            if (err == "Out of memory!") { out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out; }
+            return fail("it does not open (" + err + ")");
+        }
+        entries = ctx.entries;
+    } catch (const std::bad_alloc&) {
+        out.verdict = SelfCheckOutcome::kSkipped; out.reason = "not enough memory to read it back"; return out;
+    } catch (const std::exception& ex) {
+        return fail(std::string("the reader failed: ") + ex.what());
+    }
+    nzr::derr::Clear();
+    for (const LegacyCnEntry& e : entries) { entry_bytes[e.path] += e.size; ++out.entries; out.bytes += e.size; }
+    std::map<std::string, std::uint64_t> want_bytes;
+    std::map<std::string, std::vector<const nzr::selfcheck::Item*>> by_name;
+    for (const nzr::selfcheck::Item& it : expected) { want_bytes[it.name] += it.len; by_name[it.name].push_back(&it); }
+    for (const auto& kv : want_bytes) {
+        const auto g = entry_bytes.find(kv.first);
+        if (g == entry_bytes.end()) return fail("an entry is missing: " + kv.first);
+        if (g->second != kv.second) return fail("an entry has the wrong size: " + kv.first);
+    }
+    for (const auto& kv : entry_bytes)
+        if (want_bytes.find(kv.first) == want_bytes.end()) return fail("an entry was not in the input: " + kv.first);
+    for (const LegacyCnEntry& e : entries) {
+        if (!e.has_checksum || e.checksum_na) continue;
+        const auto g = by_name.find(e.path);
+        if (g == by_name.end() || g->second.size() != 1u) continue;   // split or repeated: no whole-file value
+        const nzr::selfcheck::Item& it = *g->second.front();
+        if (it.has_ck && it.off == 0u && it.len == e.size && it.ck != e.checksum)
+            return fail("an entry carries the wrong checksum: " + e.path);
+    }
     return out;
 }
 
@@ -15438,6 +15863,12 @@ static bool RunWorkersConcurrently(unsigned workers, unsigned pool, const RangeO
 
 int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> sources, std::ostream& os,
                          const std::chrono::steady_clock::time_point& add_start, unsigned p0) {
+    {
+        // what the engines read as the thread count (DAT_08183620 + 1): the
+        // banner's `Threads:`, -t capped at the host's
+        const unsigned host = HostThreadCount();
+        nzr::opt_enc::SetEngineThreads((options.threads > 0u && options.threads < host) ? options.threads : host);
+    }
     // Ghosts count here (the split and the window are sized before anything is
     // opened), but not in what the footer reports as compressed.
     std::uint64_t total = 0, stored = 0;
@@ -15630,7 +16061,39 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         std::error_code ec;
         fs::remove(write_path, ec);
     };
-    std::ostream& out = simulate ? discard : static_cast<std::ostream&>(file_out);
+    // Everything that goes into the file passes this tee, which keeps its CRC-64:
+    // the self-check run during the compression compares it with the file on
+    // disk once it is closed (the decoders saw the bytes on their way out).
+    struct CrcTee : std::streambuf {
+        std::streambuf* dst = nullptr;
+        nzr::selfcheck::Crc64 crc;
+        std::uint64_t n = 0;
+        LiveDemux* demux = nullptr;   // set once the stub (w32c) is out
+        int overflow(int c) override {
+            if (c == EOF) return 0;
+            const unsigned char b = static_cast<unsigned char>(c);
+            crc.Update(&b, 1u); ++n;
+            if (demux) demux->Feed(&b, 1u);
+            return dst->sputc(static_cast<char>(c));
+        }
+        std::streamsize xsputn(const char* q, std::streamsize k) override {
+            const std::streamsize w = dst->sputn(q, k);
+            if (w > 0) {
+                const auto* u = reinterpret_cast<const unsigned char*>(q);
+                crc.Update(u, static_cast<std::size_t>(w)); n += static_cast<std::uint64_t>(w);
+                if (demux) demux->Feed(u, static_cast<std::size_t>(w));
+            }
+            return w;
+        }
+        int sync() override { return dst->pubsync(); }
+        pos_type seekoff(off_type off, std::ios_base::seekdir dir, std::ios_base::openmode which) override {
+            if (off == 0 && dir == std::ios_base::cur && (which & std::ios_base::out)) return pos_type(static_cast<off_type>(n));
+            return pos_type(off_type(-1));
+        }
+    } tee;
+    tee.dst = file_out.rdbuf();
+    std::ostream tee_out(&tee);
+    std::ostream& out = simulate ? discard : tee_out;
     // `w32c` writes the Windows self-extractor stub first and the ordinary
     // archive after it -- measured byte for byte: the original's output is
     // `nz_w32c.sfx` verbatim followed by exactly the archive `a` would write,
@@ -15653,6 +16116,8 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
             if (got > 0) out.write(buf, got);
         }
     }
+    LiveDemux demux;
+    if (!simulate) tee.demux = &demux;
     // -co block: FUN_0804cec0, 0x0804d63a .. 0x0804d787. Two reserves are taken
     // off the budget on top of a flat 1 MB, the rest is split five ways with the
     // window, and the result is rounded to a byte-float and then stepped once.
@@ -15699,8 +16164,9 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
     PrintStoreEncodeHeader(os, options, workers, window, header_codec, archive_line_printed);
     // one codec state per worker stream (the original's workers own their windows)
     std::vector<EncodeCodec> codecs(workers);
+    const std::uint64_t read_ahead = (nzr::opt_enc::EngineThreads() > 1u) ? EncodeReadBufferBytes(options) / workers : 0u;
     for (EncodeCodec& c : codecs) { c.p0 = p0; c.co_block = co_block;
-                                    c.cm_a_bits = cm_a_bits; c.cm_b_bits = cm_b_bits; }
+                                    c.cm_a_bits = cm_a_bits; c.cm_b_bits = cm_b_bits; c.read_ahead = read_ahead; }
     EncodeStatus status(workers);
     std::uint64_t read_ms = 0, write_ms = 0;
     const auto timed_write = [&](const std::vector<unsigned char>& v) {
@@ -15723,6 +16189,33 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         return {b, e};
     };
     for (unsigned k = 0; k < workers; ++k) { const auto r = range_of(k); status.total[k] = r.second - r.first; }
+    // The self-check follows each stream while it is written when its codec allows
+    // it (NZ_SELFCHECK_AFTER=1: after the fact, as before v0.18.0).
+    // It holds a decoder per stream next to the encoder, so the working set is
+    // about twice the Compressor lines' figure while it runs: a 32-bit build
+    // keeps the check after the fact past 1 GB of that (the encoders' memory
+    // is given back before that check reads the archive).
+    //
+    // And it needs that much memory to be available: with less, the check runs
+    // after the fact (one model at a time, the encoders' given back first) rather
+    // than pushing the machine into swap. For -cc that is about 870 MB instead of
+    // 440 at the default -m.
+    const std::uint64_t engines = header_codec.MemoryBytes(window, nzr::opt_enc::EngineThreads()) * workers;
+    const std::uint64_t avail_mb = HostAvailableMemoryMB();
+    const bool roomy = (sizeof(void*) > 4u || 2u * engines <= (1ull << 30)) &&
+                       (avail_mb == 0u || 2u * engines + (256ull << 20) <= avail_mb * (1ull << 20));
+    // It is a thread of its own per stream, so `-t1` keeps the one-thread order
+    // (compress, then check); NZ_SELFCHECK_LIVE=1 asks for it anyway (tests).
+    const bool live_wanted = nzr::opt_enc::EngineThreads() > 1u || NZ_ENV("NZ_SELFCHECK_LIVE") != nullptr;
+    const bool live_check = !simulate && NZ_ENV("NZ_NO_SELFCHECK") == nullptr && NZ_ENV("NZ_SELFCHECK_AFTER") == nullptr &&
+                            LiveStreamCheck::Handles(p0) && roomy && live_wanted;
+    if (live_check) {
+        for (unsigned k = 0; k < workers; ++k) {
+            const auto r = range_of(k);
+            codecs[k].live = std::make_shared<LiveStreamCheck>(p0, r.second - r.first);
+            demux.Route(k, codecs[k].live);
+        }
+    }
     // The worker streams are independent, so with more than one thread they are
     // compressed concurrently and written in the SAME order as below, which keeps
     // the archive byte-identical to the one-thread run. The pool is T = min(-t,
@@ -15825,7 +16318,14 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         // The engines are done; their memory goes back before the archive is read
         // (the -cc model alone is the size of the decoder's).
         std::vector<nzr::selfcheck::Item> expected;
+        // per stream: the live check, and the length and CRC-64 of what it read
+        std::vector<std::shared_ptr<LiveStreamCheck>> lives;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> want_stream;
         for (EncodeCodec& c : codecs) {
+            std::uint64_t crc = nzr::selfcheck::Crc64::Empty(), len = 0;
+            for (const nzr::selfcheck::Item& it : c.expected) { crc = nzr::selfcheck::Crc64::Combine(crc, it.crc, it.len); len += it.len; }
+            want_stream.emplace_back(len, crc);
+            lives.push_back(c.live);
             expected.insert(expected.end(), std::make_move_iterator(c.expected.begin()),
                             std::make_move_iterator(c.expected.end()));
             if (c.cc != nullptr) { NzCmDestroy(c.cc); c.cc = nullptr; }
@@ -15838,13 +16338,34 @@ int RunAddStoreContainer(const CliOptions& options, std::vector<EncodeSource> so
         // NZ_NO_SELFCHECK=1 skips it (timings against the original, for one).
         if (NZ_ENV("NZ_NO_SELFCHECK") == nullptr) {
             const auto t0 = std::chrono::steady_clock::now();
-            check = SelfCheckWrittenArchive(write_path, options, expected);
+            // Followed while it was written: wait for the decoders to finish the
+            // last records, then check the container. A stream that could not be
+            // followed (memory) sends the whole archive through the reader after
+            // the fact, as before.
+            bool after = !live_check;
+            if (live_check) {
+                tee.demux = nullptr;
+                if (!demux.Clean()) { check.verdict = SelfCheckOutcome::kFailed; check.reason = "the file ends inside a record"; }
+                for (std::size_t k = 0; k < lives.size() && check.verdict == SelfCheckOutcome::kOk; ++k) {
+                    const LiveStreamCheck::Result& r = lives[k]->Wait();
+                    if (r.state == LiveStreamCheck::kSkipped) { after = true; continue; }
+                    if (r.state != LiveStreamCheck::kOk) { check.verdict = SelfCheckOutcome::kFailed; check.reason = r.reason; break; }
+                    if (r.out_len != want_stream[k].first) { check.verdict = SelfCheckOutcome::kFailed; check.reason = "a stream decodes to the wrong length"; break; }
+                    if (r.out_crc != want_stream[k].second) { check.verdict = SelfCheckOutcome::kFailed; check.reason = "a stream decodes to other bytes"; break; }
+                }
+                lives.clear();   // their models go back before anything else is read
+                if (check.verdict == SelfCheckOutcome::kOk && !after)
+                    check = SelfCheckStructure(write_path, expected, tee.crc.Final(), tee.n);
+            }
+            if (after && check.verdict == SelfCheckOutcome::kOk)
+                check = SelfCheckWrittenArchive(write_path, options, expected);
             if (NZ_ENV("NZ_TRACE_SELFCHECK")) {
                 const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-                std::fprintf(stderr, "[selfcheck] %s entries=%zu bytes=%llu items=%zu ms=%lld%s%s\n",
+                std::fprintf(stderr, "[selfcheck] %s entries=%zu bytes=%llu items=%zu ms=%lld mode=%s%s%s\n",
                              check.verdict == SelfCheckOutcome::kOk ? "ok" : check.verdict == SelfCheckOutcome::kFailed ? "FAILED" : "skipped",
                              check.entries, static_cast<unsigned long long>(check.bytes), expected.size(),
-                             static_cast<long long>(ms), check.reason.empty() ? "" : ": ", check.reason.c_str());
+                             static_cast<long long>(ms), after ? "after" : "during",
+                             check.reason.empty() ? "" : ": ", check.reason.c_str());
             }
             if (check.verdict == SelfCheckOutcome::kFailed) {
                 // What this port wrote does not read back: nothing is left behind

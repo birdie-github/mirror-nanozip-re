@@ -6,6 +6,7 @@
 #pragma once
 #include <cstdarg>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -28,7 +29,9 @@ inline void Construct(const char* fmt, ...) {
     static std::mutex m;
     static std::set<std::string> seen;
     std::lock_guard<std::mutex> g(m);
-    if (seen.insert(b).second) std::fprintf(stderr, "[construct] %s\n", b);
+    // NZ_TRACE_CONSTRUCTS=all: every occurrence, in order (to compare two archives block by block)
+    static const bool all = [] { const char* v = std::getenv("NZ_TRACE_CONSTRUCTS"); return v && std::strcmp(v, "all") == 0; }();
+    if (all || seen.insert(b).second) std::fprintf(stderr, "[construct] %s\n", b);
 }
 
 }  // namespace nz_trace

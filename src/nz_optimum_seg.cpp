@@ -130,8 +130,87 @@ void CoSegmenter::Prime(const std::uint8_t* buf, std::uint32_t n) {
     snapshot = counts;
 }
 
+namespace { unsigned g_engine_threads = 1; }
+void SetEngineThreads(unsigned n) { g_engine_threads = (n == 0u) ? 1u : n; }
+unsigned EngineThreads() { return g_engine_threads; }
+
 std::uint32_t CoSegmenter::Split(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower) {
     if (n <= lower + 0x1000u) return n;
+    if (lower <= 0xfffffu && g_engine_threads > 1u) return SplitTwoJobs(buf, n, lower);
+    return SplitSerial(buf, n, lower);
+}
+
+// FUN_0808c740 above one thread: the search is cut at mid = (lower + n) / 2 into
+// two jobs for the pool (FUN_0808b970), and the cheaper answer wins, the upper
+// job on a tie.
+//   * the upper job (flag 0) is the serial walk on the live counts, from n down
+//     to mid inclusive;
+//   * the lower job (flag 1) walks UP from `lower` to mid - 1 on the snapshot
+//     Prime left, applying the same four updates to the byte at each position,
+//     so after the byte at `p` the left half is [lower, p] -- but it records `p`
+//     as the cut, one short of the split it measured. That is the original's
+//     own off-by-one, and its output; it also reaches `lower` and `lower + 1`,
+//     which the serial walk never tries.
+// Both start from the same threshold and from the cut n. The counts end as the
+// upper job leaves them; only their per-cell sums are read again (Fold).
+std::uint32_t CoSegmenter::SplitTwoJobs(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower) {
+    const std::int64_t threshold = cost - static_cast<std::int64_t>(static_cast<std::uint64_t>(cost) >> 5) -
+                                   0x2000000;
+    const std::uint32_t mid = (lower + n) >> 1;
+    auto walk_step = [](std::vector<std::uint32_t>& t, std::uint32_t c, std::uint32_t b,
+                        std::int64_t& left, std::int64_t& right) {
+        const std::uint32_t cell = c * 0x100u + b;
+        const std::uint32_t lc = t[kLeftCell + cell];
+        t[kLeftCell + cell] = lc - 1u;
+        left += Step(lc - 1u);
+        const std::uint32_t rc = t[kRightCell + cell];
+        t[kRightCell + cell] = rc + 1u;
+        right -= Step(rc);
+        const std::uint32_t lt = t[kLeftTotal + c];
+        t[kLeftTotal + c] = lt - 1u;
+        left -= Step(lt - 1u);
+        const std::uint32_t rt = t[kRightTotal + c];
+        t[kRightTotal + c] = rt + 1u;
+        right += Step(rt);
+    };
+
+    // the upper job
+    std::int64_t a_best = threshold;
+    std::uint32_t a_cut = n;
+    {
+        std::int64_t left = cost, right = 0;
+        for (std::uint32_t pos = n; pos-- > mid;) {
+            const std::uint32_t c = (static_cast<std::uint32_t>(buf[pos - 2u]) * 0x20u + buf[pos - 1u]) & 0xffu;
+            walk_step(counts, c, buf[pos], left, right);
+            const std::int64_t total = left + right;
+            if (total < a_best) { a_best = total; a_cut = pos; }
+        }
+    }
+    // the lower job
+    std::int64_t b_best = threshold;
+    std::uint32_t b_cut = n;
+    {
+        std::int64_t left = cost - prev_cost, right = prev_cost;
+        std::uint32_t c = 0;
+        if (lower >= 2u) c = (static_cast<std::uint32_t>(buf[lower - 2u]) << 5) + buf[lower - 1u];
+        else if (lower == 1u) c = buf[0];
+        for (std::uint32_t pos = lower; pos < mid; ++pos) {
+            c &= 0xffu;
+            const std::uint32_t b = buf[pos];
+            walk_step(snapshot, c, b, left, right);
+            const std::int64_t total = left + right;
+            if (total < b_best) { b_best = total; b_cut = pos; }
+            c = c * 0x20u + b;
+        }
+    }
+    const std::uint32_t cut = (a_best <= b_best) ? a_cut : b_cut;
+    if (NZ_ENV("NZOPT_TRACE_SPLIT"))
+        std::fprintf(stderr, "[SPLIT2] n=%u lower=%u mid=%u upper=%u/%lld lower=%u/%lld -> %u\n", n, lower, mid,
+                     a_cut, (long long)a_best, b_cut, (long long)b_best, cut != 0u ? cut : n);
+    return cut != 0u ? cut : n;
+}
+
+std::uint32_t CoSegmenter::SplitSerial(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower) {
 
     std::int64_t left = cost;
     std::int64_t right = 0;

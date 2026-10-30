@@ -327,7 +327,11 @@ std::uint32_t LzEncodeChunk(State& st, std::uint32_t n) {
                                 }
                             }
                             ++e;
-                            if ((reinterpret_cast<std::uintptr_t>(e) & 0xfu) == 0u) break;
+                            // the end of the 4-entry bucket: the original tests the
+                            // ADDRESS for 16-byte alignment, its table being aligned;
+                            // ours is a vector (8-aligned from 32-bit msvcrt), so the
+                            // test is on the index, or the walk depends on the heap
+                            if (((e - table) & 3) == 0) break;
                             const std::uint32_t ev = *e;
                             if (ev == 0u || tag != (f.tagmask & ev)) break;
                             cpos = ev >> (f.shift & 31u);

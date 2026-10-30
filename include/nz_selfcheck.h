@@ -116,6 +116,8 @@ struct Item {
     std::uint64_t len = 0;
     std::uint64_t crc = 0;
     bool complete = true;         // reader side: every byte of it was decoded
+    std::uint32_t ck = 0;         // writer side: the archive checksum of the piece
+    bool has_ck = false;
 };
 
 // The reader's items, filled while a self-check decode runs (from the stream

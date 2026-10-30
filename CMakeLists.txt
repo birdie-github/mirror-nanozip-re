@@ -19,6 +19,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(RECON_SOURCES
     src/main.cpp
     src/sfx_cli.cpp
+    src/nz_xp_compat.cpp
     src/sfx_archive.cpp
     src/linux32_cm_map.cpp
     src/lzpf_arith.cpp
@@ -65,6 +66,17 @@ else()
     # never opens one. Harmless on 64-bit, where off_t is already 64 bits.
     add_compile_definitions(_FILE_OFFSET_BITS=64)
     target_compile_options(nz-re PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# A 32-bit Windows build is marked large-address-aware, as the original's 32-bit
+# nz.exe is: on 64-bit Windows it then has 4 GB of address space instead of 2,
+# which large -m settings (e.g. `a -cc -m1500m`) need.
+if(WIN32 AND CMAKE_SIZEOF_VOID_P EQUAL 4)
+    if(MSVC)
+        target_link_options(nz-re PRIVATE /LARGEADDRESSAWARE)
+    else()
+        target_link_options(nz-re PRIVATE -Wl,--large-address-aware)
+    endif()
 endif()
 
 # Optional unit-test binary for the lzpf arith primitives.

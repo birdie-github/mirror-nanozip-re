@@ -21,6 +21,11 @@
 # C. Replace: a failed check over an existing archive leaves it byte-identical
 #    and no .nzre-part behind.
 #
+# Since v0.18.0 the check of -co/-cO/-cc runs WHILE `a` compresses when it has
+# more than one thread (a decoder per stream fed each record as it is written,
+# then the container); at -t1, as here, it runs after the fact. Run this again
+# with NZ_SELFCHECK_LIVE=1 to put every case through the concurrent check.
+#
 # No original needed. About a minute.
 # usage: tests/encode/selfcheck.sh [workdir]   (NZ_RECON as elsewhere)
 set -u
@@ -84,7 +89,7 @@ broken() {   # 0 when the archive really is damaged: t fails, or x does not give
 }
 caught() {   # codec, fault, extra switches
     local c=$1 f=$2; shift 2
-    rm -f off.nz on.nz on.nz.nzre-part
+    rm -f off.nz on.nz on.nz.nzre-part on2.nz
     NZ_NO_SELFCHECK=1 NZ_SELFCHECK_FAULT=$f "$OURS" a -$c -t1 "$@" -r off.nz in </dev/null >/dev/null 2>&1
     if ! broken off.nz; then bad "B -$c $f: the injected fault did not break the archive -- this case proves nothing"; return; fi
     NZ_SELFCHECK_FAULT=$f "$OURS" a -$c -t1 "$@" -r on.nz in </dev/null > con.txt 2>&1; local rc=$?

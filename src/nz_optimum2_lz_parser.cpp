@@ -32,6 +32,7 @@
 #include "nz_optimum2_lz_tables.h"   // DAT_08173140 == OptimumDat08172380, DAT_08173290 == ...4d0
 #include "nz_cm.h"
 #include "nz_env.h"
+#include "nz_optimum_seg.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -154,6 +155,10 @@ struct NzOptimum2LzDecoder::ParserState {
     // capacity outlives the call (built fresh, they were ~2 allocations a byte)
     std::vector<Cand> cands_buf;
     std::vector<std::uint32_t> chain_buf;
+    // above one thread: every position's list for the chunk (BuildAsyncLists)
+    std::vector<Cand> aflat;
+    std::vector<std::uint32_t> aoff;
+    bool alists = false;
     bool verbose = false;            // debug: dump one Find's chain walk
     bool ready = false;
     const std::uint8_t* block = nullptr;
@@ -209,8 +214,13 @@ struct NzOptimum2LzDecoder::ParserState {
     }
 
     // FUN_08073ca0: the 2-byte 4-slot cache probes, then the bt4 tree descent.
+    // capv != 0: at most capv entries, a further one overwriting the last (the
+    // async finder's per-position list, see BuildAsyncLists)
     void Find(const std::uint8_t* base, std::uint32_t cur, std::uint32_t cend,
-              std::uint32_t maxlen, std::vector<Cand>& outc, std::uint32_t depth) {
+              std::uint32_t maxlen, std::vector<Cand>& outc, std::uint32_t depth, std::uint32_t capv = 0) {
+        const auto put = [&](Cand c) {
+            if (capv == 0u || outc.size() < capv) outc.push_back(c); else outc.back() = c;
+        };
         const std::uint32_t w = Load32(base + cur);
         const std::uint32_t hidx = ((w >> 19u) ^ w) & headmask;
         std::uint32_t chain = head[hidx];
@@ -227,11 +237,11 @@ struct NzOptimum2LzDecoder::ParserState {
             if (Load16(base + cur) == Load16(base + cp) && valid(cp)) {
                 if (maxlen < 2u) { bestlen = 1; }
                 else {
-                    outc.push_back({2u, cp});
+                    put({2u, cp});
                     bestlen = 2;
                     if ((~maskA & cs[0]) == tagv) {
                         if (base[cp + 2u] == base[cur + 2u] && maxlen > 2u) {
-                            outc.push_back({3u, cp});
+                            put({3u, cp});
                             bestlen = 3; got3 = true;
                         }
                     }
@@ -246,7 +256,7 @@ struct NzOptimum2LzDecoder::ParserState {
                     const std::uint32_t cp = maskA & e;
                     if (base[cp + 2u] == base[cur + 2u] && Load16(base + cur) == Load16(base + cp) &&
                         valid(cp) && maxlen > 2u) {
-                        outc.push_back({3u, cp});
+                        put({3u, cp});
                         bestlen = 3;
                         break;
                     }
@@ -279,7 +289,7 @@ struct NzOptimum2LzDecoder::ParserState {
                     bool ok = true;
                     for (std::int32_t q = pre; q >= 0; --q) if (base[cur + q] != base[cp + q]) { ok = false; break; }
                     if (!ok) { *ls = ch[0]; *gt = ch[1]; return; }
-                    outc.push_back({j, cp});
+                    put({j, cp});
                     bestlen = j;
                     if (lim == j) { *ls = ch[0]; *gt = ch[1]; return; }
                 }
@@ -292,6 +302,67 @@ struct NzOptimum2LzDecoder::ParserState {
             }
         }
         *gt = 0; *ls = 0;
+    }
+
+    // The -co engine's async finder (FUN_0805b580/0805c1a0/0805b640, see
+    // nz_optimum_lz_parser.cpp) with -cO's parameters from 0x08087ea6: at most
+    // 0x10 entries per position plus the carry, the shift-on shortcut from a
+    // top length of 0x200, chain depth 0x100.
+    void BuildAsyncLists(const std::uint8_t* base, std::uint32_t pos0, std::uint32_t chunk, const std::uint32_t* lro) {
+        constexpr std::uint32_t kMax = 0x10u, kNice = 0x200u, kDepth = 0x100u;
+        aflat.clear();
+        aoff.assign(static_cast<std::size_t>(chunk) + 1u, 0u);
+        const std::uint32_t cend = pos0 + chunk;
+        std::uint32_t carry = 0;
+        std::vector<Cand> one;
+        std::uint32_t p = 0;
+        while (p < chunk) {
+            const std::uint32_t cur = pos0 + p;
+            const std::uint32_t capv = carry + kMax;
+            one.clear();
+            Find(base, cur, cend, chunk - p, one, kDepth, capv);
+            {
+                const std::uint32_t bestf = one.empty() ? 0u : one.back().len;
+                const std::uint32_t lidx = lrhash & lrmask;
+                const std::uint32_t prev = lr[lidx];
+                const std::uint32_t tag = lrhash & 0xffc00000u;
+                if ((cur & 0xffu) == 0u) lr[lidx] = tag + (cur >> 8u);
+                if ((prev & 0xffc00000u) == tag) {
+                    const std::uint32_t lsrc = (prev & 0x3fffffu) << 8u;
+                    const std::uint32_t remain = chunk - p;
+                    const std::uint32_t w = winsize - lsrc;
+                    const std::uint32_t avail = (remain < w) ? remain : w;
+                    std::uint32_t a = 0;
+                    for (;;) {
+                        if (base[lsrc + a] != base[cur + a]) break;
+                        ++a;
+                        if (avail <= a) break;
+                    }
+                    if (bestf < a) { if (one.size() < capv) one.push_back({a, lsrc}); else one.back() = {a, lsrc}; }
+                }
+                lrhash = lrhash * 0x104070bu + base[cur + 0x100u] - lro[base[cur]];
+            }
+            aoff[p] = static_cast<std::uint32_t>(aflat.size());
+            aflat.insert(aflat.end(), one.begin(), one.end());
+            carry = capv - static_cast<std::uint32_t>(one.size());
+            ++p;
+            if (!one.empty() && one.back().len >= kNice) {
+                std::uint32_t src = one.back().src, len = one.back().len;
+                for (;;) {
+                    const std::uint32_t c2 = pos0 + p;
+                    if ((c2 & 0xffu) == 0u) lr[lrhash & lrmask] = (lrhash & 0xffc00000u) + (c2 >> 8u);
+                    lrhash = lrhash * 0x104070bu + base[c2 + 0x100u] - lro[base[c2]];
+                    ++src; --len;
+                    aoff[p] = static_cast<std::uint32_t>(aflat.size());
+                    aflat.push_back({len, src});
+                    carry = carry + kMax - 1u;
+                    ++p;
+                    if (len < 2u) break;
+                }
+            }
+        }
+        aoff[chunk] = static_cast<std::uint32_t>(aflat.size());
+        alists = true;
     }
 };
 
@@ -673,6 +744,8 @@ void NzOptimum2LzDecoder::BeginChunk(std::uint32_t off, std::uint32_t len,
     for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[ring_pos + i];
     F.lrhash = lrh;
     ++F.lrgen;
+    F.alists = false;
+    if (nzr::opt_enc::EngineThreads() > 1u) F.BuildAsyncLists(b0, ring_pos, len, LrOut());
 }
 
 void NzOptimum2LzDecoder::BeginParse(const std::uint8_t* data, std::uint32_t size) {
@@ -744,6 +817,8 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         for (std::uint32_t i = 0; i < 0x100u; ++i) lrh = lrh * 0x104070bu + b0[F.pos0 + i];
         F.lrhash = lrh;
         ++F.lrgen;
+        F.alists = false;
+        if (nzr::opt_enc::EngineThreads() > 1u) F.BuildAsyncLists(b0, F.pos0, F.size, LRO);
     }
 
     std::uint8_t* const base = ring_.Base();
@@ -909,6 +984,10 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
         cands.clear();
         if (const char* fd = NZ_ENV("NZO2_FINDDBG"))
             F.verbose = (cur == static_cast<std::uint32_t>(std::atoi(fd)));
+        if (F.alists) {
+            const std::uint32_t k = cur - pos0;
+            cands.assign(F.aflat.begin() + F.aoff[k], F.aflat.begin() + F.aoff[k + 1u]);
+        } else
         F.Find(base, cur, cend, remain, cands, 0x100u);
         if (F.verbose) {
             std::fprintf(stderr, "[FIND] -> %zu candidates:", cands.size());
@@ -916,7 +995,7 @@ bool NzOptimum2LzDecoder::ParseNextFlush(std::vector<Optimum2Decision>& out) {
             std::fprintf(stderr, "\n");
             F.verbose = false;
         }
-        {
+        if (!F.alists) {
             const std::uint32_t bestf = cands.empty() ? 0u : cands.back().len;
             F.lrseen[cur & 4095u] = {cur + 1u, F.lrgen, F.lrhash};
             const std::uint32_t lidx = F.lrhash & F.lrmask;

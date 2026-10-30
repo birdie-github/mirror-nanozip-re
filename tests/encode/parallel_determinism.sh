@@ -3,8 +3,10 @@
 # threads and must write the same archive as on one.
 #
 # The worker COUNT is part of the format (it is -pN, or the automatic split's
-# min(-t, host) from 8 MB); the POOL that runs them is not, so for every method:
-#   a. `-p4 -t4` == `-p4 -t1` (one thread per worker vs the serial loop), on a
+# min(-t, host) from 8 MB), and so is the thread count the ENGINES see (-t: above
+# one, -co/-cO/-cc take their multi-threaded forms, quirk 82); the POOL that runs
+# the workers is not, so for every method:
+#   a. `-p4 -t4` == `NZ_THREADS=1 -p4 -t4` (one thread per worker vs the serial loop), on a
 #      directory with text, random data, a binary, empty files, a one-byte file
 #      and an unreadable one, sized so that worker boundaries fall inside files;
 #   b. the automatic split: `-t4` == `NZ_THREADS=1 -t4` (same worker count,
@@ -14,13 +16,14 @@
 #   d. the self-check passes on the threaded archive;
 #   e. quirk 56 (the dictionary transform's table is filled once per process and
 #      each worker inherits it from the workers before it in processing order
-#      [1..N-1, 0]): `-p3 -t3` == `-p3 -t1` with the text in worker 0, 1, 2 or
+#      [1..N-1, 0]): `-p3 -t3` == `NZ_THREADS=1 -p3 -t3` with the text in worker 0, 1, 2 or
 #      all three. Those inputs must first be shown to depend on the inheritance:
 #      with NZ_TEST_Q56_ISOLATED=1 (no job inherits) at least one of them must
 #      come out different for each method that runs the transform, or the
 #      "identical" proves nothing.
 # With the original present (NZ_ORIG, default ../linux32/nz), the quirk-56
-# archives are also compared with its `-p3 -t1`.
+# archives are also compared with its `-p3 -t1`, at `-t1` here too (above one
+# thread the original's record order follows its scheduler, quirk 14).
 #
 # A few minutes (-cc dominates).
 # usage: tests/encode/parallel_determinism.sh [workdir]   (NZ_RECON as elsewhere)
@@ -63,10 +66,10 @@ enc() {   # out.nz, then the env/switch words: runs `a` with the check off, cons
 # ---------------------------------------------------------------- a-d
 for c in cf cF cd cD co cO cc; do
     A="$OURS a -$c -r -y"
-    enc s1.nz $A -p4 -t1
+    enc s1.nz NZ_THREADS=1 $A -p4 -t4
     enc s4.nz $A -p4 -t4
     if [ ! -s s1.nz ]; then bad "-$c: no serial archive: $(tail -2 s1.nz.con)"; continue; fi
-    cmp -s s1.nz s4.nz && [ "$(footer s1.nz.con)" = "$(footer s4.nz.con)" ] && ok || bad "a -$c: -p4 -t4 differs from -p4 -t1"
+    cmp -s s1.nz s4.nz && [ "$(footer s1.nz.con)" = "$(footer s4.nz.con)" ] && ok || bad "a -$c: -p4 -t4 differs from its pool of one"
     enc u1.nz NZ_THREADS=1 $A -t4
     enc u4.nz $A -t4
     cmp -s u1.nz u4.nz && ok || bad "b -$c: the automatic split at -t4 differs from its pool of one"
@@ -84,15 +87,17 @@ for c in cd cD co cO cc; do
     sensitive=0
     for f in w0 w1 w2 all; do
         rm -f q1.nz q3.nz qi.nz
-        NZ_NO_SELFCHECK=1 "$OURS" a -$c -p3 -t1 q1.nz q/$f.bin </dev/null >/dev/null 2>&1
+        NZ_NO_SELFCHECK=1 NZ_THREADS=1 "$OURS" a -$c -p3 -t3 q1.nz q/$f.bin </dev/null >/dev/null 2>&1
         NZ_NO_SELFCHECK=1 "$OURS" a -$c -p3 -t3 q3.nz q/$f.bin </dev/null >/dev/null 2>&1
         NZ_NO_SELFCHECK=1 NZ_TEST_Q56_ISOLATED=1 "$OURS" a -$c -p3 -t3 qi.nz q/$f.bin </dev/null >/dev/null 2>&1
-        [ -s q1.nz ] && cmp -s q1.nz q3.nz && ok || bad "e -$c $f: -p3 -t3 differs from -p3 -t1"
+        [ -s q1.nz ] && cmp -s q1.nz q3.nz && ok || bad "e -$c $f: -p3 -t3 differs from its pool of one"
         cmp -s q1.nz qi.nz || sensitive=$((sensitive+1))
         if [ $have_orig = 1 ]; then
             rm -f qo.nz
             env -i PATH=/usr/bin:/bin "$ORIG" a -$c -p3 -t1 qo.nz q/$f.bin </dev/null >/dev/null 2>&1
-            cmp -s qo.nz q3.nz && ok || bad "e -$c $f: -p3 -t3 differs from the original's -p3 -t1"
+            rm -f qt.nz
+            NZ_NO_SELFCHECK=1 "$OURS" a -$c -p3 -t1 qt.nz q/$f.bin </dev/null >/dev/null 2>&1
+            cmp -s qo.nz qt.nz && ok || bad "e -$c $f: -p3 -t1 differs from the original's -p3 -t1"
         fi
     done
     [ $sensitive -gt 0 ] && ok || bad "e -$c: no input depends on the inheritance -- these cases prove nothing"

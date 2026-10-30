@@ -40,7 +40,18 @@ struct CoSegmenter {
     // `lower + 2`. Returns n when no split pays. CONSUMES the primed counts, so
     // one Split per Prime.
     std::uint32_t Split(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower);
+
+  private:
+    std::uint32_t SplitSerial(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower);
+    std::uint32_t SplitTwoJobs(const std::uint8_t* buf, std::uint32_t n, std::uint32_t lower);
 };
+
+// The thread count the compressor's engines see (the original's DAT_08183620 + 1:
+// `Threads:` capped by -t). Above one, several passes take their multi-threaded
+// form, which is visible in the archive -- the segmenter's split search is the
+// first: FUN_0808c740 runs it as two jobs. Set before a stream is compressed.
+void SetEngineThreads(unsigned n);
+unsigned EngineThreads();
 
 // One fresh segmenter over `n` bytes, capped at `block_size`: what
 // FUN_0808d0b0 does for a buffer that is filled in one go. Kept for the tests;

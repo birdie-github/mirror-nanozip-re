@@ -627,6 +627,23 @@ std::uint64_t HostFreeMemoryMB() {
 #endif
 }
 
+// The memory a new allocation can still get without pushing anything out:
+// MemAvailable on Linux (free pages plus reclaimable cache), ullAvailPhys on
+// Windows. 0 when unknown. Decides whether `a` can afford the self-check's
+// decoders next to its encoders.
+std::uint64_t HostAvailableMemoryMB() {
+#if defined(_WIN32)
+    MEMORYSTATUSEX ms;
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms)) return 0u;
+    return ms.ullAvailPhys / (1024ull * 1024ull);
+#else
+    const std::string a = ProcField("/proc/meminfo", "MemAvailable");
+    if (a.empty()) return 0u;
+    return std::strtoull(a.c_str(), nullptr, 10) / 1024u;
+#endif
+}
+
 void PrintBanner(std::ostream& os) {
     // Layout matched to the original, which prints the product line and then the
     // host summary with no leading blank. The build tag names the platform the way
